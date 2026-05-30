@@ -10,3 +10,6 @@ seaborn
 soundfile
 tqdm
 panns-inference
+sounddevice
+streamlit
+plotly

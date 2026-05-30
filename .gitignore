@@ -14,3 +14,4 @@ models/*.pt
 
 # Opcional: ignorar las gráficas de resultados si no quieres subirlas
 # results/
+test_simulacion/
