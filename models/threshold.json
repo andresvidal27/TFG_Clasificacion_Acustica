@@ -1,0 +1,18 @@
+{
+  "bg_class_id": 10,
+  "bg_class_name": "background",
+  "cnn": {
+    "accuracy": 74.3169,
+    "roc_auc": 0.9175,
+    "average_precision": 0.9482,
+    "optimal_threshold": 0.8176
+  },
+  "transfer": {
+    "accuracy": 93.6813,
+    "roc_auc": 0.9904,
+    "average_precision": 0.9961,
+    "optimal_threshold": 0.8219
+  },
+  "selected_model": "transfer",
+  "selected_threshold": 0.8219
+}
