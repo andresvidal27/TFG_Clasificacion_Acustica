@@ -37,7 +37,7 @@ def load_models():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     panns = AudioTagging(checkpoint_path=str(BASE_DIR / "models/Cnn14_mAP=0.431.pth"), device=device)
     model_transfer = TransferHead(num_classes=len(CLASS_MAP)).to(device).eval()
-    model_transfer.load_state_dict(torch.load(BASE_DIR / "models/transfer_head_best.pt", map_location=device, weights_only=True))
+    model_transfer.load_state_dict(torch.load(BASE_DIR / "models_v2/transfer_mejorado_best.pt", map_location=device, weights_only=True))
     
     model_cnn = AudioCNN(num_classes=len(CLASS_MAP)).to(device).eval()
     try:
@@ -67,14 +67,20 @@ def analyze_audio_buffer(y, sr, snr=None):
         
         # Transfer
         with torch.no_grad():
-            _, emb = panns.inference(bloque[None, :])
+            bloque_32k = librosa.resample(bloque, orig_sr=sr, target_sr=32000)
+            _, emb = panns.inference(bloque_32k[None, :])
             probs_tf = F.softmax(model_transfer(torch.from_numpy(emb[0]).float().unsqueeze(0).to(device)), dim=1).cpu().numpy()[0]
             clase_pred = CLASS_MAP[np.argmax(probs_tf)]
             res_tf.append({"segundo": segundo, "probs": probs_tf})
             
-            if clase_pred in clases_alerta and np.max(probs_tf) >= theta:
-                if not any(c == clase_pred and (segundo - s) <= 3.0 for s, c, _ in alertas):
-                    alertas.append((segundo, clase_pred, np.max(probs_tf)))
+            if clase_pred in clases_alerta:
+                max_prob = np.max(probs_tf)
+                segunda_prob = np.sort(probs_tf)[-2]
+                
+                # Regla: Supera el umbral (theta) O (es mayor a 0.70 y le saca al menos 0.30 de diferencia a la segunda clase)
+                if (max_prob >= theta) or (max_prob >= 0.70 and (max_prob - segunda_prob) >= 0.30):
+                    if not any(c == clase_pred and (segundo - s) <= 3.0 for s, c, _ in alertas):
+                        alertas.append((segundo, clase_pred, max_prob))
                 
         # CNN
         if model_cnn:
@@ -122,10 +128,33 @@ if "audio_y" in st.session_state:
     y, sr = st.session_state["audio_y"], st.session_state["audio_sr"]
     
     with tabs[1]:
-        avg_tf, avg_cnn = np.mean([r["probs"] for r in st.session_state["res_tf"]], axis=0), np.mean([r["probs"] for r in st.session_state["res_cnn"]], axis=0)
-        df = pd.DataFrame({"Transfer": avg_tf, "CNN": avg_cnn}, index=[CLASS_MAP[i] for i in range(len(CLASS_MAP))])
+        st.audio(y, sample_rate=sr)
+        
+        alertas = st.session_state.get("alertas", [])
+        opciones = ["Media Global", "Selección Manual"] + [f"{cl.upper()} a los {seg:.1f}s" for seg, cl, _ in alertas]
+        opcion_sel = st.selectbox("Seleccionar Instante", opciones)
+        
+        seg = None
+        if opcion_sel == "Media Global":
+            probs_tf = np.mean([r["probs"] for r in st.session_state["res_tf"]], axis=0) if st.session_state["res_tf"] else np.zeros(len(CLASS_MAP))
+            probs_cnn = np.mean([r["probs"] for r in st.session_state["res_cnn"]], axis=0) if st.session_state["res_cnn"] else np.zeros(len(CLASS_MAP))
+            title = "Comparativa Media Global"
+        elif opcion_sel == "Selección Manual":
+            duracion = float(len(y) / sr)
+            seg = st.slider("Seleccionar segundo", 0.0, duracion, 0.0, step=0.5)
+            title = f"Probabilidades en {seg:.1f}s"
+        else:
+            idx = opciones.index(opcion_sel) - 2
+            seg = alertas[idx][0]
+            title = f"Probabilidades en {opcion_sel}"
+
+        if seg is not None:
+            probs_tf = min(st.session_state["res_tf"], key=lambda r: abs(r["segundo"] - seg))["probs"] if st.session_state["res_tf"] else np.zeros(len(CLASS_MAP))
+            probs_cnn = min(st.session_state["res_cnn"], key=lambda r: abs(r["segundo"] - seg))["probs"] if st.session_state["res_cnn"] else np.zeros(len(CLASS_MAP))
+
+        df = pd.DataFrame({"Transfer": probs_tf, "CNN": probs_cnn}, index=[CLASS_MAP[i] for i in range(len(CLASS_MAP))])
         df_filt = df[df.max(axis=1) > 0.05].reset_index().rename(columns={"index": "Clase"}).melt(id_vars="Clase", var_name="Modelo", value_name="Prob")
-        st.plotly_chart(px.bar(df_filt, x="Clase", y="Prob", color="Modelo", barmode="group", title="Comparativa Media"), width="stretch")
+        st.plotly_chart(px.bar(df_filt, x="Clase", y="Prob", color="Modelo", barmode="group", title=title), width="stretch")
         
     with tabs[2]:
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 3))

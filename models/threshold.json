@@ -1,17 +1,1 @@
-{
-  "theta": 0.85,
-  "selected_threshold": 0.85,
-  "selected_model": "transfer",
-  "bg_class_id": -1,
-  "bg_class_name": "none",
-  "cnn": {
-    "accuracy": 83.00970873786407,
-    "roc_auc": 0.0,
-    "optimal_threshold": 0.85
-  },
-  "transfer": {
-    "accuracy": 96.11650485436894,
-    "roc_auc": 0.0,
-    "optimal_threshold": 0.85
-  }
-}
+{"theta": 0.85}

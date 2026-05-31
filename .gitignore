@@ -9,8 +9,11 @@ env/
 data_esc50/
 data_urban/
 features/
+features_v2/
 models/*.pth
 models/*.pt
+models_v2/*.pth
+models_v2/*.pt
 
 # Opcional: ignorar las gráficas de resultados si no quieres subirlas
 # results/
