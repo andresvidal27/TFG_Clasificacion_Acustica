@@ -25,7 +25,7 @@ from datos_y_configuracion import BASE_DIR
 # ==============================================================================
 class AudioCNN(nn.Module):
     """Red Convolucional de 3 bloques para clasificación de espectrogramas."""
-    def __init__(self, num_classes=12):
+    def __init__(self, num_classes=8):
         super().__init__()
         self.features = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=3, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
@@ -92,7 +92,7 @@ def entrenar_cnn(con_ruido=False):
     print(f"Iniciando entrenamiento de la CNN {'(Con Aumento de Ruido)' if con_ruido else '(Base)'}...")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    df = pd.read_csv(BASE_DIR / "dataset_index_features.csv")
+    df = pd.read_csv(BASE_DIR / "dataset_index_features.csv").dropna(subset=["feature_path"])
     df = df[df["feature_path"].notna()]
     
     train_df = df[df["split"] == "train"].reset_index(drop=True)

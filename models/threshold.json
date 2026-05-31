@@ -1,18 +1,17 @@
 {
-  "bg_class_id": 10,
-  "bg_class_name": "background",
+  "theta": 0.85,
+  "selected_threshold": 0.85,
+  "selected_model": "transfer",
+  "bg_class_id": -1,
+  "bg_class_name": "none",
   "cnn": {
-    "accuracy": 74.3169,
-    "roc_auc": 0.9175,
-    "average_precision": 0.9482,
-    "optimal_threshold": 0.8176
+    "accuracy": 83.00970873786407,
+    "roc_auc": 0.0,
+    "optimal_threshold": 0.85
   },
   "transfer": {
-    "accuracy": 93.6813,
-    "roc_auc": 0.9904,
-    "average_precision": 0.9961,
-    "optimal_threshold": 0.8219
-  },
-  "selected_model": "transfer",
-  "selected_threshold": 0.8219
+    "accuracy": 96.11650485436894,
+    "roc_auc": 0.0,
+    "optimal_threshold": 0.85
+  }
 }

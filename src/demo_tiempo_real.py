@@ -76,6 +76,8 @@ def main():
 
     print("\n[LISTO] Escuchando micrófono... (Pulsa Ctrl+C para salir)\n")
     
+    ultimo_tiempo_alerta = {}
+    
     try:
         with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, callback=audio_callback, blocksize=TAMANO_AVANCE):
             while True:
@@ -99,26 +101,30 @@ def main():
                 clase_pred = CLASS_MAP[id_pred]
 
                 # Solo disparamos si la clase está explícitamente en la lista de alertas
-                clases_alerta = ["glass_breaking", "gun_shot", "dog_bark", "siren", "crying_baby", "door_knock", "screaming"]
+                clases_alerta = ["rotura_cristal", "disparo", "ladrido_perro", "sirena", "bebe_llorando", "llamar_puerta", "grito"]
                 if clase_pred in clases_alerta and confianza >= theta:
-                    timestamp = datetime.now().strftime("%H:%M:%S")
-                    file_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    print(f"[{timestamp}] ⚠️ ALERTA DETECTADA: {clase_pred.upper()} (Confianza: {confianza:.2f})")
-                    
-                    # Guardar clip de audio
-                    import soundfile as sf
-                    sf.write(alerts_dir / f"alerta_{file_ts}_{clase_pred}.wav", buffer, SAMPLE_RATE)
-                    
-                    # Guardar espectrograma
-                    import librosa.display
-                    sig_22k = librosa.resample(buffer, orig_sr=SAMPLE_RATE, target_sr=22050)
-                    logmel = compute_logmel(sig_22k)
-                    plt.figure(figsize=(6, 4))
-                    librosa.display.specshow(logmel, sr=22050, hop_length=512, x_axis='time', cmap='magma')
-                    plt.title(f"Alerta: {clase_pred} ({confianza:.2f})")
-                    plt.tight_layout()
-                    plt.savefig(alerts_dir / f"alerta_{file_ts}_{clase_pred}.png")
-                    plt.close()
+                    tiempo_actual = time.time()
+                    if tiempo_actual - ultimo_tiempo_alerta.get(clase_pred, 0) > 3.0:
+                        ultimo_tiempo_alerta[clase_pred] = tiempo_actual
+                        
+                        timestamp = datetime.now().strftime("%H:%M:%S")
+                        file_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        print(f"[{timestamp}] ⚠️ ALERTA DETECTADA: {clase_pred.upper()} (Confianza: {confianza:.2f})")
+                        
+                        # Guardar clip de audio
+                        import soundfile as sf
+                        sf.write(alerts_dir / f"alerta_{file_ts}_{clase_pred}.wav", buffer, SAMPLE_RATE)
+                        
+                        # Guardar espectrograma
+                        import librosa.display
+                        sig_22k = librosa.resample(buffer, orig_sr=SAMPLE_RATE, target_sr=22050)
+                        logmel = compute_logmel(sig_22k)
+                        plt.figure(figsize=(6, 4))
+                        librosa.display.specshow(logmel, sr=22050, hop_length=512, x_axis='time', cmap='magma')
+                        plt.title(f"Alerta: {clase_pred} ({confianza:.2f})")
+                        plt.tight_layout()
+                        plt.savefig(alerts_dir / f"alerta_{file_ts}_{clase_pred}.png")
+                        plt.close()
                 else:
                     # No es alerta o no supera el umbral: no hacemos nada
                     pass

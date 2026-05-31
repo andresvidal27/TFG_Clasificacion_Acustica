@@ -25,7 +25,7 @@ from entrenar_cnn import calcular_pesos_clases
 # ==============================================================================
 class TransferHead(nn.Module):
     """Cabeza densa para clasificar a partir de embeddings (2048 dimensiones)."""
-    def __init__(self, num_classes=12):
+    def __init__(self, num_classes=8):
         super().__init__()
         self.fc = nn.Sequential(
             nn.Linear(2048, 256),
@@ -63,7 +63,7 @@ def entrenar_transfer():
     print("Iniciando entrenamiento del modelo Transfer Learning (CNN14 Embeddings)...")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    df = pd.read_csv(BASE_DIR / "dataset_index_emb.csv")
+    df = pd.read_csv(BASE_DIR / "dataset_index_emb.csv").dropna(subset=["embedding_path"])
     df = df[df["embedding_path"].notna()]
     
     train_df = df[df["split"] == "train"].reset_index(drop=True)

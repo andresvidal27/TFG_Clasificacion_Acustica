@@ -44,9 +44,8 @@ SEED = 42
 
 # Mapa de Clases
 CLASS_MAP = {
-    0: "glass_breaking", 1: "gun_shot", 2: "dog_bark", 3: "siren",
-    4: "car_horn", 5: "crying_baby", 6: "thunderstorm", 7: "fireworks",
-    8: "clock_alarm", 9: "door_knock", 10: "background", 11: "screaming",
+    0: "rotura_cristal", 1: "disparo", 2: "ladrido_perro", 3: "sirena",
+    4: "bebe_llorando", 5: "llamar_puerta", 6: "grito", 7: "fondo"
 }
 NAME_TO_ID = {v: k for k, v in CLASS_MAP.items()}
 
@@ -101,16 +100,16 @@ def generar_indice_dataset():
 
     rows = []
     # 1. Añadir sonidos puros de ESC-50
-    esc_only = ["glass_breaking", "crying_baby", "thunderstorm", "fireworks", "clock_alarm"]
-    for cat in esc_only:
+    esc_only = {"glass_breaking": "rotura_cristal", "crying_baby": "bebe_llorando"}
+    for cat, esp_cat in esc_only.items():
         for _, r in esc50[esc50["category"] == cat].iterrows():
-            rows.append({"filepath": str(DATA_ESC50_DIR / "audio" / r["filename"]), "label_id": NAME_TO_ID[cat], "label_name": cat, "source": "esc50"})
+            rows.append({"filepath": str(DATA_ESC50_DIR / "audio" / r["filename"]), "label_id": NAME_TO_ID[esp_cat], "label_name": esp_cat, "source": "esc50"})
     
     for _, r in esc50[esc50["category"] == "door_wood_knock"].iterrows():
-        rows.append({"filepath": str(DATA_ESC50_DIR / "audio" / r["filename"]), "label_id": NAME_TO_ID["door_knock"], "label_name": "door_knock", "source": "esc50"})
+        rows.append({"filepath": str(DATA_ESC50_DIR / "audio" / r["filename"]), "label_id": NAME_TO_ID["llamar_puerta"], "label_name": "llamar_puerta", "source": "esc50"})
 
-    # 2. Clases combinadas (Dog bark, siren, car horn, gun shot)
-    for cat_esc, cat_urb, label in [("dog", "dog_bark", "dog_bark"), ("siren", "siren", "siren"), ("car_horn", "car_horn", "car_horn")]:
+    # 2. Clases combinadas (Dog bark, siren, gun shot)
+    for cat_esc, cat_urb, label in [("dog", "dog_bark", "ladrido_perro"), ("siren", "siren", "sirena")]:
         esc_subset = esc50[esc50["category"] == cat_esc]
         for _, r in esc_subset.iterrows():
             rows.append({"filepath": str(DATA_ESC50_DIR / "audio" / r["filename"]), "label_id": NAME_TO_ID[label], "label_name": label, "source": "esc50"})
@@ -122,23 +121,23 @@ def generar_indice_dataset():
     # Gun shot (Urban)
     urb_gun = urban[urban["class"] == "gun_shot"].sample(n=300, random_state=SEED) if len(urban[urban["class"] == "gun_shot"]) > 300 else urban[urban["class"] == "gun_shot"]
     for _, r in urb_gun.iterrows():
-        rows.append({"filepath": str(DATA_URBAN_DIR / f"fold{r['fold']}" / r["slice_file_name"]), "label_id": NAME_TO_ID["gun_shot"], "label_name": "gun_shot", "source": "urban"})
+        rows.append({"filepath": str(DATA_URBAN_DIR / f"fold{r['fold']}" / r["slice_file_name"]), "label_id": NAME_TO_ID["disparo"], "label_name": "disparo", "source": "urban"})
 
-    # 3. Background
-    bg_urban = urban[urban["class"].isin(["air_conditioner", "children_playing", "drilling", "engine_idling", "jackhammer", "street_music"])]
-    danger_cats = {"glass_breaking", "crying_baby", "thunderstorm", "fireworks", "clock_alarm", "door_wood_knock", "dog", "siren", "car_horn"}
-    bg_esc = esc50[~esc50["category"].isin(danger_cats)]
-    bg_rows = []
-    for _, r in bg_esc.iterrows(): bg_rows.append({"filepath": str(DATA_ESC50_DIR / "audio" / r["filename"]), "label_id": NAME_TO_ID["background"], "label_name": "background", "source": "esc50"})
-    for _, r in bg_urban.iterrows(): bg_rows.append({"filepath": str(DATA_URBAN_DIR / f"fold{r['fold']}" / r["slice_file_name"]), "label_id": NAME_TO_ID["background"], "label_name": "background", "source": "urban"})
-    bg_df = pd.DataFrame(bg_rows)
-    if len(bg_df) > 700: bg_df = bg_df.sample(n=700, random_state=SEED)
-    rows.extend(bg_df.to_dict("records"))
+    # 3. Clase background (el resto de los audios)
+    esc50_used_cats = ["glass_breaking", "crying_baby", "door_wood_knock", "dog", "siren"]
+    esc50_bg = esc50[~esc50["category"].isin(esc50_used_cats)].sample(n=150, random_state=SEED)
+    for _, r in esc50_bg.iterrows():
+        rows.append({"filepath": str(DATA_ESC50_DIR / "audio" / r["filename"]), "label_id": NAME_TO_ID["fondo"], "label_name": "fondo", "source": "esc50"})
+
+    urban_used_cats = ["dog_bark", "siren", "gun_shot"]
+    urban_bg = urban[~urban["class"].isin(urban_used_cats)].sample(n=150, random_state=SEED)
+    for _, r in urban_bg.iterrows():
+        rows.append({"filepath": str(DATA_URBAN_DIR / f"fold{r['fold']}" / r["slice_file_name"]), "label_id": NAME_TO_ID["fondo"], "label_name": "fondo", "source": "urban"})
 
     # 4. Gritos
     gritos_dir = DATA_ESC50_DIR / "gritos"
     if gritos_dir.exists():
-        gritos = [{"filepath": str(f), "label_id": NAME_TO_ID["screaming"], "label_name": "screaming", "source": "esc50"} for f in list(gritos_dir.glob("*.wav"))[:300]]
+        gritos = [{"filepath": str(f), "label_id": NAME_TO_ID["grito"], "label_name": "grito", "source": "esc50"} for f in list(gritos_dir.glob("*.wav"))[:300]]
         rows.extend(gritos)
 
     df = pd.DataFrame(rows)
