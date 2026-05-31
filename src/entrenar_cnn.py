@@ -60,8 +60,19 @@ class DatasetEspectrogramas(Dataset):
         # Cargar numpy array y añadir dimension de canal: (1, 128, 216)
         logmel = np.load(self.rutas[idx])[np.newaxis, ...]
         if self.aplicar_ruido:
+            # 1. Ruido Gaussiano
             ruido = np.random.normal(0, self.ruido_std, logmel.shape)
             logmel = logmel + ruido.astype(np.float32)
+            
+            # 2. Frequency Masking (enmascarar hasta 10 bandas de frecuencia)
+            f_mask = np.random.randint(0, 15)
+            f_0 = np.random.randint(0, max(1, logmel.shape[1] - f_mask))
+            logmel[:, f_0:f_0+f_mask, :] = 0
+            
+            # 3. Time Masking (enmascarar hasta 20 frames de tiempo)
+            t_mask = np.random.randint(0, 30)
+            t_0 = np.random.randint(0, max(1, logmel.shape[2] - t_mask))
+            logmel[:, :, t_0:t_0+t_mask] = 0
             
         x = torch.from_numpy(logmel).float()
         y = torch.tensor(self.etiquetas[idx], dtype=torch.long)
@@ -101,7 +112,7 @@ def entrenar_cnn(con_ruido=False):
     historial = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
     mejor_loss = float("inf")
     paciencia, epochs_sin_mejora = 10, 0
-    nombre_modelo = "cnn_noise" if con_ruido else "cnn_base"
+    nombre_modelo = "cnn_base"
     ruta_guardado = BASE_DIR / "models" / f"{nombre_modelo}_best.pt"
     ruta_guardado.parent.mkdir(exist_ok=True)
 
@@ -157,5 +168,4 @@ def entrenar_cnn(con_ruido=False):
     print(f"[OK] Modelo guardado en {ruta_guardado}\n")
 
 if __name__ == "__main__":
-    entrenar_cnn(con_ruido=False)
     entrenar_cnn(con_ruido=True)

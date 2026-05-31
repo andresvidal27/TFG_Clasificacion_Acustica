@@ -98,8 +98,9 @@ def main():
                 confianza = probs[id_pred]
                 clase_pred = CLASS_MAP[id_pred]
 
-                # Si no es "background" y supera el umbral, es una alerta
-                if clase_pred != "background" and confianza >= theta:
+                # Solo disparamos si la clase está explícitamente en la lista de alertas
+                clases_alerta = ["glass_breaking", "gun_shot", "dog_bark", "siren", "crying_baby", "door_knock", "screaming"]
+                if clase_pred in clases_alerta and confianza >= theta:
                     timestamp = datetime.now().strftime("%H:%M:%S")
                     file_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                     print(f"[{timestamp}] ⚠️ ALERTA DETECTADA: {clase_pred.upper()} (Confianza: {confianza:.2f})")
@@ -119,7 +120,8 @@ def main():
                     plt.savefig(alerts_dir / f"alerta_{file_ts}_{clase_pred}.png")
                     plt.close()
                 else:
-                    print(f"  Analizando... -> FONDO ({confianza:.2f})" if clase_pred == 'background' else f"  Analizando... -> {clase_pred} (ignorado por umbral)")
+                    # No es alerta o no supera el umbral: no hacemos nada
+                    pass
                     
     except KeyboardInterrupt:
         print("\n[FIN] Deteniendo captura en tiempo real.")

@@ -140,7 +140,9 @@ def main():
         # --------------------------
 
         # Máquina de estados
-        if clase_pred != "background" and confianza >= theta:
+        # Solo disparamos si la clase está explícitamente en la lista de alertas
+        clases_alerta = ["glass_breaking", "gun_shot", "dog_bark", "siren", "crying_baby", "door_knock", "screaming"]
+        if clase_pred in clases_alerta and confianza >= theta:
             if estado == "ESPERA":
                 # Transición a ALERTA
                 estado = "ALERTA"
@@ -173,10 +175,8 @@ def main():
                 estado = "ESPERA"
         else:
             # Estado normal: ESPERA
-            if clase_pred == "background":
-                print(f"[{segundo_actual:05.1f}s]   Analizando... fondo ({confianza:.2f})")
-            else:
-                print(f"[{segundo_actual:05.1f}s]   Analizando... {clase_pred} (ignorado, {confianza:.2f} < {theta:.2f})")
+            # No es alerta o no supera el umbral: no hacemos nada
+            pass
 
 
     # 5. Evaluación de Resultados contra el Ground Truth

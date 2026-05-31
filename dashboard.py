@@ -2,8 +2,8 @@
 dashboard.py
 ------------
 Dashboard de análisis interactivo con Streamlit.
-Permite visualizar de forma interactiva y dinámica los resultados obtenidos 
-en las diferentes fases del TFG de Clasificación Acústica.
+Permite visualizar de forma interactiva y dinámica el análisis en tiempo real 
+de los audios capturados o subidos, comparando los modelos entrenados.
 """
 
 import sys
@@ -19,6 +19,9 @@ import plotly.express as px
 import librosa
 import librosa.display
 import matplotlib.pyplot as plt
+import soundfile as sf
+import torch
+import torch.nn.functional as F
 
 warnings.filterwarnings("ignore")
 
@@ -26,348 +29,366 @@ warnings.filterwarnings("ignore")
 BASE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR / "src"))
 
-from src.datos_y_configuracion import SR as CONFIG_SR, compute_logmel, preprocess_audio, add_awgn
+from src.datos_y_configuracion import SR as CONFIG_SR, compute_logmel, add_awgn, CLASS_MAP
+from src.entrenar_transfer import TransferHead
+from src.entrenar_cnn import AudioCNN
+from panns_inference import AudioTagging
 
-st.set_page_config(page_title="Dashboard Vigilancia Acústica", layout="wide")
+st.set_page_config(page_title="Dashboard Vigilancia Acústica en Vivo", layout="wide")
 
 # ── Funciones de carga de datos ──────────────────────────────────────────────
 
-@st.cache_data
-def load_dataset_index():
-    return pd.read_csv(BASE_DIR / "dataset_index.csv")
-
-@st.cache_data
-def load_threshold_data():
-    with open(BASE_DIR / "models/threshold.json") as f:
-        return json.load(f)
-
-@st.cache_data
-def load_history(path):
-    with open(path) as f:
-        return json.load(f)
-
-@st.cache_data
-def load_robustness_csv():
-    return pd.read_csv(BASE_DIR / "results/robustness_snr.csv")
-
-@st.cache_data
-def load_resultados_simulacion():
-    return pd.read_csv(BASE_DIR / "results/resultados_simulacion.csv")
-
-# ── Funciones de visualización ───────────────────────────────────────────────
-
-def plot_plotly_history(history, title):
-    """Crea una curva de aprendizaje interactiva con Plotly."""
-    epochs = list(range(1, len(history["train_loss"]) + 1))
+@st.cache_resource
+def load_models():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    fig = go.Figure()
+    # Modelo Transfer Learning (PANNs + Head)
+    panns = AudioTagging(checkpoint_path=str(BASE_DIR / "models/Cnn14_mAP=0.431.pth"), device=device)
+    num_clases = len(CLASS_MAP)
+    model_transfer = TransferHead(num_classes=num_clases).to(device).eval()
+    model_transfer.load_state_dict(torch.load(BASE_DIR / "models/transfer_head_best.pt", map_location=device, weights_only=True))
     
-    # Loss
-    fig.add_trace(go.Scatter(x=epochs, y=history["train_loss"], name="Train Loss",
-                             line=dict(color="#3b82f6", dash="dash")))
-    fig.add_trace(go.Scatter(x=epochs, y=history["val_loss"], name="Val Loss",
-                             line=dict(color="#1d4ed8", width=2)))
+    # Modelo CNN Base
+    model_cnn = AudioCNN(num_classes=num_clases).to(device).eval()
+    try:
+        model_cnn.load_state_dict(torch.load(BASE_DIR / "models/audio_cnn_noise_best.pt", map_location=device, weights_only=True))
+    except Exception:
+        try:
+            model_cnn.load_state_dict(torch.load(BASE_DIR / "models/audio_cnn_best.pt", map_location=device, weights_only=True))
+        except Exception:
+            model_cnn = None # Si no hay CNN base, no fallar
+
+    umbral_path = BASE_DIR / "models" / "threshold.json"
+    theta = 0.5
+    if umbral_path.exists():
+        with open(umbral_path) as f:
+            data = json.load(f)
+            theta = data.get("theta", data.get("selected_threshold", 0.82))
+            
+    return panns, model_transfer, model_cnn, device, theta
+
+def analyze_audio_buffer(y, sr, aplicar_ruido_snr=None):
+    """
+    Analiza el audio con ventana deslizante usando los modelos cargados.
+    Si aplicar_ruido_snr tiene un valor (ej. 10, 0), inyecta ruido antes del análisis.
+    Devuelve las probabilidades en el tiempo y las alertas.
+    """
+    panns, model_transfer, model_cnn, device, theta = load_models()
     
-    # Accuracy (en un eje Y secundario para que sea visible en la misma gráfica, 
-    # o mejor simplemente lo hacemos en subplots)
-    from plotly.subplots import make_subplots
-    fig = make_subplots(rows=1, cols=2, subplot_titles=("Función de Pérdida (Loss)", "Precisión (Accuracy)"))
+    if aplicar_ruido_snr is not None and aplicar_ruido_snr != "Limpio":
+        y = add_awgn(y, int(aplicar_ruido_snr))
+        
+    ventana = int(5.0 * sr)
+    avance = int(2.5 * sr)
+    clases_alerta = ["glass_breaking", "gun_shot", "dog_bark", "siren", "crying_baby", "door_knock", "screaming"]
     
-    fig.add_trace(go.Scatter(x=epochs, y=history["train_loss"], name="Train Loss",
-                             line=dict(color="#3b82f6", dash="dash")), row=1, col=1)
-    fig.add_trace(go.Scatter(x=epochs, y=history["val_loss"], name="Val Loss",
-                             line=dict(color="#1d4ed8", width=2)), row=1, col=1)
-                             
-    fig.add_trace(go.Scatter(x=epochs, y=history["train_acc"], name="Train Acc",
-                             line=dict(color="#10b981", dash="dash")), row=1, col=2)
-    fig.add_trace(go.Scatter(x=epochs, y=history["val_acc"], name="Val Acc",
-                             line=dict(color="#047857", width=2)), row=1, col=2)
-                             
-    fig.update_layout(title_text=title, height=400, hovermode="x unified")
+    if len(y) < ventana:
+        y = np.pad(y, (0, ventana - len(y)))
+        
+    resultados_tf = []
+    resultados_cnn = []
+    alertas_detectadas = []
+    
+    for i in range(0, max(1, len(y) - ventana + 1), avance):
+        bloque = y[i:i+ventana]
+        segundo = min((i + ventana) / sr, len(y)/sr)
+        
+        # 1. Inferencia Transfer Learning
+        with torch.no_grad():
+            _, emb = panns.inference(bloque[None, :])
+            emb_tensor = torch.from_numpy(emb[0]).float().unsqueeze(0).to(device)
+            logits_tf = model_transfer(emb_tensor)
+            probs_tf = F.softmax(logits_tf, dim=1).cpu().numpy()[0]
+            
+            id_pred_tf = np.argmax(probs_tf)
+            confianza_tf = probs_tf[id_pred_tf]
+            clase_pred_tf = CLASS_MAP[id_pred_tf]
+            
+            resultados_tf.append({"segundo": segundo, "probs": probs_tf})
+            
+            if clase_pred_tf in clases_alerta and confianza_tf >= theta:
+                alertas_detectadas.append((segundo, clase_pred_tf, float(confianza_tf)))
+                
+                alerts_dir = BASE_DIR / "alerts"
+                if alerts_dir.exists():
+                    ruido_str = "" if (aplicar_ruido_snr is None or aplicar_ruido_snr == "Limpio") else f"_SNR{aplicar_ruido_snr}dB"
+                    
+                    archivo_wav = alerts_dir / f"alerta_{segundo:05.1f}s_{clase_pred_tf}{ruido_str}.wav"
+                    sf.write(archivo_wav, bloque, sr)
+                    
+                    archivo_img = alerts_dir / f"alerta_{segundo:05.1f}s_{clase_pred_tf}{ruido_str}.png"
+                    sig_22k = librosa.resample(bloque, orig_sr=sr, target_sr=22050)
+                    logmel = compute_logmel(sig_22k)
+                    plt.figure(figsize=(10, 4))
+                    librosa.display.specshow(logmel, sr=22050, hop_length=512, x_axis='time', cmap='magma')
+                    plt.title(f"ALERTA: {clase_pred_tf.upper()} ({confianza_tf:.2f})")
+                    plt.tight_layout()
+                    plt.savefig(archivo_img)
+                    plt.close()
+                
+        # 2. Inferencia CNN Base
+        if model_cnn is not None:
+            # La CNN espera el logmel spectrogram de 22050 Hz en bloque (1, 1, 128, 216)
+            sig_22k = librosa.resample(bloque, orig_sr=sr, target_sr=22050)
+            
+            # Normalizar igual que en el entrenamiento
+            max_val = np.max(np.abs(sig_22k))
+            if max_val > 0:
+                sig_22k = sig_22k / max_val
+                
+            logmel = compute_logmel(sig_22k)
+            # Normalizar logmel de manera similar a preprocessing si es necesario
+            logmel_tensor = torch.from_numpy(logmel).float().unsqueeze(0).unsqueeze(0).to(device)
+            with torch.no_grad():
+                logits_cnn = model_cnn(logmel_tensor)
+                probs_cnn = F.softmax(logits_cnn, dim=1).cpu().numpy()[0]
+                resultados_cnn.append({"segundo": segundo, "probs": probs_cnn})
+                
+    return resultados_tf, resultados_cnn, alertas_detectadas, y
+
+def procesar_y_guardar_estado(audio_bytes):
+    """Lee el audio subido, extrae la forma de onda y la guarda en la sesión."""
+    import shutil
+    alerts_dir = BASE_DIR / "alerts"
+    if alerts_dir.exists():
+        shutil.rmtree(alerts_dir)
+    alerts_dir.mkdir(parents=True, exist_ok=True)
+    
+    audio_bytes.seek(0)
+    try:
+        y, sr = sf.read(audio_bytes)
+        if len(y.shape) > 1:
+            y = np.mean(y, axis=1)
+        if sr != CONFIG_SR:
+            y = librosa.resample(y, orig_sr=sr, target_sr=CONFIG_SR)
+    except Exception:
+        audio_bytes.seek(0)
+        y, sr = librosa.load(audio_bytes, sr=CONFIG_SR, mono=True)
+        
+    if len(y) == 0:
+        raise ValueError("No se detectaron muestras de audio.")
+        
+    st.session_state["audio_y"] = y
+    st.session_state["audio_sr"] = CONFIG_SR
+    
+    # Realizar análisis base (limpio)
+    res_tf, res_cnn, alertas, _ = analyze_audio_buffer(y, CONFIG_SR, "Limpio")
+    st.session_state["res_tf"] = res_tf
+    st.session_state["res_cnn"] = res_cnn
+    st.session_state["alertas"] = alertas
+
+
+# ── Funciones Gráficas ───────────────────────────────────────────────────────
+
+def plot_probs_over_time(resultados, title, key_prefix):
+    """Genera un gráfico de líneas con las probabilidades a lo largo del tiempo."""
+    if not resultados:
+        return None
+        
+    df_data = []
+    for res in resultados:
+        seg = res["segundo"]
+        for i, p in enumerate(res["probs"]):
+            df_data.append({"Segundo": seg, "Clase": CLASS_MAP[i], "Probabilidad": p})
+            
+    df = pd.DataFrame(df_data)
+    
+    clases_alerta = ["glass_breaking", "gun_shot", "dog_bark", "siren", "crying_baby", "door_knock", "screaming", "background"]
+    
+    clases_sel = st.multiselect(
+        "Filtrar clases en la gráfica:", 
+        options=clases_alerta, 
+        default=clases_alerta,
+        key=f"ms_{key_prefix}"
+    )
+    
+    if not clases_sel:
+        st.warning("Selecciona al menos una clase para visualizar.")
+        return None
+        
+    df = df[df["Clase"].isin(clases_sel)]
+    
+    fig = px.line(df, x="Segundo", y="Probabilidad", color="Clase", title=title, markers=True)
+    fig.update_layout(yaxis_range=[0, 1.05], height=500)
     return fig
 
 # ── Interfaz Principal ───────────────────────────────────────────────────────
 
-st.title("🎙️ Sistema de Vigilancia Acústica - Resultados TFG")
+st.title("🎙️ Dashboard Analizador de Audio en Vivo")
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "Prueba en Vivo",
     "Comparativa de Modelos", 
     "Espectrogramas", 
     "Resultados CNN", 
     "Resultados Transfer", 
-    "Análisis de Robustez",
-    "Simulación de Campo"
+    "Análisis de Robustez"
 ])
 
-# ── PESTAÑA 1: Comparativa de Modelos ────────────────────────────────────────
+# ── PESTAÑA 1: Prueba en Vivo ───────────────────────────────────────────
 with tab1:
-    st.header("Comparativa de Rendimiento: Transfer Learning vs CNN Base")
+    st.header("🔴 Prueba en Vivo: Micrófono y Archivos")
+    st.write("Sube un archivo de audio o graba directamente con tu micrófono para detectar si hay situaciones de alerta.")
     
-    th_data = load_threshold_data()
-    cnn_data = th_data["cnn"]
-    best = th_data["transfer"]
+    opcion = st.radio("Selecciona la fuente de audio:", ["🎤 Grabar con Micrófono", "📁 Subir Archivo"], horizontal=True)
     
-    # 1. Métricas con Delta (Diferencia visual explícita)
-    col1, col2, col3 = st.columns(3)
+    audio_data = None
     
-    acc_diff = best['accuracy'] - cnn_data['accuracy']
-    col1.metric("Precisión Global (Accuracy)", f"{best['accuracy']:.2f}%", f"+{acc_diff:.2f}% vs CNN")
-    
-    roc_diff = best['roc_auc'] - cnn_data['roc_auc']
-    col2.metric("Capacidad de Detección (ROC AUC)", f"{best['roc_auc']:.4f}", f"+{roc_diff:.4f} vs CNN")
-    
-    ap_diff = best['average_precision'] - cnn_data['average_precision']
-    col3.metric("Precisión Media (AP)", f"{best['average_precision']:.4f}", f"+{ap_diff:.4f} vs CNN")
-    
-    st.divider()
-    
-    # 2. Gráfico de Barras Agrupadas para comparar métricas a escala 100
-    st.subheader("El salto cualitativo al integrar PANNs (Transfer Learning)")
-    
-    fig = go.Figure(data=[
-        go.Bar(name='CNN (Entrenada desde cero)', 
-               x=['Accuracy (%)', 'ROC AUC (x100)', 'Average Precision (x100)'], 
-               y=[cnn_data['accuracy'], cnn_data['roc_auc']*100, cnn_data['average_precision']*100],
-               marker_color='#94a3b8', 
-               text=[f"{cnn_data['accuracy']:.1f}%", f"{cnn_data['roc_auc']:.3f}", f"{cnn_data['average_precision']:.3f}"], 
-               textposition='auto'),
-               
-        go.Bar(name='Transfer Learning (PANNs)', 
-               x=['Accuracy (%)', 'ROC AUC (x100)', 'Average Precision (x100)'], 
-               y=[best['accuracy'], best['roc_auc']*100, best['average_precision']*100],
-               marker_color='#3b82f6', 
-               text=[f"{best['accuracy']:.1f}%", f"{best['roc_auc']:.3f}", f"{best['average_precision']:.3f}"], 
-               textposition='auto')
-    ])
-    
-    fig.update_layout(barmode='group', height=450, 
-                      yaxis_title="Puntuación (Escala 0-100)", 
-                      legend_title_text="Modelo Evaluado",
-                      margin=dict(t=20, b=20))
-                      
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # 3. Bloque de Reducción de Errores
-    st.divider()
-    col_e1, col_e2 = st.columns([1, 2])
-    
-    error_cnn = 100 - cnn_data['accuracy']
-    error_tf = 100 - best['accuracy']
-    reduccion_errores = ((error_cnn - error_tf) / error_cnn) * 100
-    
-    with col_e1:
-        st.subheader("Reducción de Errores")
-        st.markdown(f"<h1 style='text-align: center; color: #10b981; font-size: 4rem; padding-top: 1rem;'>-{reduccion_errores:.1f}%</h1>", unsafe_allow_html=True)
-        st.markdown("<p style='text-align: center; color: gray;'>Reducción total de fallos de clasificación frente al modelo base</p>", unsafe_allow_html=True)
+    if opcion == "🎤 Grabar con Micrófono":
+        audio_data = st.audio_input("Haz clic en el micrófono para empezar a grabar")
+    else:
+        audio_data = st.file_uploader("Sube tu archivo de audio (.wav, .mp3, .ogg)", type=["wav", "mp3", "ogg"])
         
-    with col_e2:
-        fig2 = go.Figure(go.Indicator(
-            mode = "number+delta",
-            value = error_tf,
-            number = {'suffix': "%", 'font': {'size': 50}},
-            title = {"text": "Tasa de Error Actual (Transfer Learning)"},
-            delta = {'reference': error_cnn, 'relative': False, 'valueformat': '.1f', 'suffix': '% (CNN base)', 'decreasing': {'color': '#10b981'}}
-        ))
-        fig2.update_layout(height=250)
-        st.plotly_chart(fig2, use_container_width=True)
+    if audio_data is not None:
+        st.audio(audio_data)
+        if st.button("Analizar Audio", type="primary"):
+            with st.spinner("Procesando y ejecutando redes neuronales sobre el audio..."):
+                try:
+                    procesar_y_guardar_estado(audio_data)
+                    alertas = st.session_state.get("alertas", [])
+                    if alertas:
+                        st.error(f"¡PELIGRO! Se han detectado {len(alertas)} alertas en este audio.")
+                        for seg, clase, conf in alertas:
+                            st.warning(f"⚠️ **{clase.upper()}** detectado cerca del segundo {seg:.1f} (Confianza: {conf:.2f})")
+                    else:
+                        st.success("✅ Todo tranquilo. No se detectaron alertas de peligro en el audio.")
+                except ValueError as ve:
+                    if str(ve) == "No se detectaron muestras de audio.":
+                        st.info("No se detectaron muestras de audio y ya.")
+                    else:
+                        st.error(f"Ocurrió un error al procesar el audio: {ve}")
+                except Exception as e:
+                    st.error(f"Ocurrió un error al procesar el audio: {e}")
 
-# ── PESTAÑA 2: Explorador de Espectrogramas ──────────────────────────────────
+# Comprobamos si hay audio analizado para renderizar las demás pestañas
+audio_cargado = "audio_y" in st.session_state
+
+# ── PESTAÑA 2: Comparativa de Modelos ────────────────────────────────────────
 with tab2:
-    st.header("Impacto del Ruido en los Espectrogramas Log-Mel")
-    
-    df = load_dataset_index()
-    clases = df["label_name"].unique().tolist()
-    
-    col_a, col_b = st.columns([1, 3])
-    with col_a:
-        clase_sel = st.selectbox("Selecciona una clase:", clases)
-        snr_sel = st.select_slider(
-            "Nivel de Ruido (SNR):", 
-            options=["Limpio", "20 dB", "10 dB", "0 dB"]
-        )
+    st.header("Comparativa de Modelos para el Audio Actual")
+    if not audio_cargado:
+        st.info("Sube o graba un audio en la pestaña 'Prueba en Vivo' y pulsa en 'Analizar Audio'.")
+    else:
+        res_tf = st.session_state["res_tf"]
+        res_cnn = st.session_state["res_cnn"]
         
-        snr_val = None if snr_sel == "Limpio" else int(snr_sel.replace(" dB", ""))
-        
-    with col_b:
-        # Coger un audio al azar de esa clase
-        ejemplo = df[df["label_name"] == clase_sel].iloc[0]
-        ruta = BASE_DIR / ejemplo["filepath"]
-        
-        if ruta.exists():
-            sig = preprocess_audio(str(ruta))
-            sig_ruidoso = add_awgn(sig, snr_val)
-            logmel = compute_logmel(sig_ruidoso)
-            
-            fig, ax = plt.subplots(figsize=(10, 4))
-            img = librosa.display.specshow(logmel, sr=CONFIG_SR, hop_length=512, x_axis='time', cmap='magma', ax=ax)
-            ax.set_title(f"Clase: {clase_sel} | SNR: {snr_sel}")
-            fig.colorbar(img, ax=ax, format="%+2.0f dB")
-            st.pyplot(fig)
+        if not res_cnn:
+            st.warning("No se ha cargado el modelo CNN base.")
         else:
-            st.error(f"No se encontró el audio en {ruta}")
-
-# ── PESTAÑA 3: Modelo CNN ────────────────────────────────────────────────────
-with tab3:
-    st.header("Resultados del Modelo CNN (Desde Cero)")
-    
-    variante = st.radio("Variante:", ["Entrenada con Ruido (Recomendada)", "CNN Base (Limpia)"], horizontal=True)
-    json_file = "audio_cnn_noise_history.json" if "Ruido" in variante else "audio_cnn_history.json"
-    
-    try:
-        hist_cnn = load_history(BASE_DIR / "models" / json_file)
-        st.plotly_chart(plot_plotly_history(hist_cnn, "Curvas de Aprendizaje - CNN"), use_container_width=True)
-    except FileNotFoundError:
-        st.warning("No se ha entrenado este modelo aún.")
-    
-    col_c1, col_c2 = st.columns(2)
-    with col_c1:
-        st.subheader("Métricas por Clase")
-        try:
-            report_cnn = pd.read_csv(BASE_DIR / "results/classification_report_cnn.csv", index_col=0)
-            st.dataframe(report_cnn, use_container_width=True)
-        except Exception:
-            st.warning("No se encontró el reporte.")
+            # Calculamos la probabilidad media de cada clase a lo largo de todo el audio
+            avg_probs_tf = np.mean([r["probs"] for r in res_tf], axis=0)
+            avg_probs_cnn = np.mean([r["probs"] for r in res_cnn], axis=0)
             
-    with col_c2:
-        st.subheader("Matriz de Confusión")
-        try:
-            st.image(str(BASE_DIR / "results/confusion_matrix_cnn.png"), use_container_width=True)
-        except Exception:
-            st.warning("No se encontró la matriz.")
-
-# ── PESTAÑA 4: Modelo Transfer Learning ──────────────────────────────────────
-with tab4:
-    st.header("Resultados de Transfer Learning (CNN14)")
-    
-    try:
-        hist_tf = load_history(BASE_DIR / "models/transfer_head_history.json")
-        st.plotly_chart(plot_plotly_history(hist_tf, "Curvas de Aprendizaje - Transfer Learning"), use_container_width=True)
-    except FileNotFoundError:
-        st.warning("No se ha entrenado el modelo Transfer aún.")
-    
-    col_t1, col_t2 = st.columns(2)
-    with col_t1:
-        st.subheader("Métricas por Clase")
-        try:
-            report_tf = pd.read_csv(BASE_DIR / "results/classification_report_transfer.csv", index_col=0)
-            st.dataframe(report_tf, use_container_width=True)
-        except Exception:
-            st.warning("No se encontró el reporte.")
+            df_comp = pd.DataFrame({
+                "Clase": [CLASS_MAP[i] for i in range(len(CLASS_MAP))],
+                "Prob_Transfer": avg_probs_tf,
+                "Prob_CNN": avg_probs_cnn
+            })
             
-    with col_t2:
-        st.subheader("Matriz de Confusión")
-        try:
-            st.image(str(BASE_DIR / "results/confusion_matrix_transfer.png"), use_container_width=True)
-        except Exception:
-            st.warning("No se encontró la matriz.")
-
-# ── PESTAÑA 5: Robustez ──────────────────────────────────────────────────────
-with tab5:
-    st.header("Análisis de Robustez ante Ruido Ambiental (AWGN)")
-    st.write("Degradación del F1-Score a medida que disminuye el ratio Señal/Ruido.")
-    
-    try:
-        df_res = load_robustness_csv()
-        
-        # Plotly interactivo
-        fig = px.line(
-            df_res, x="snr_label", y="f1", color="modelo", markers=True,
-            title="Comparativa de Robustez",
-            labels={"snr_label": "Nivel de Ruido (SNR)", "f1": "F1-Score Macro", "modelo": "Modelo"}
-        )
-        fig.add_hline(y=0.5, line_dash="dash", line_color="gray", annotation_text="Límite F1=0.5")
-        fig.update_layout(height=500)
-        # Ordenar eje X para que coincida con lo esperado (de Limpio a 0 dB)
-        fig.update_xaxes(categoryorder='array', categoryarray=["Limpio", "20 dB", "15 dB", "10 dB", "5 dB", "0 dB"])
-        
-        st.plotly_chart(fig, use_container_width=True)
-    except Exception:
-        st.warning("No se encontraron resultados de robustez. Ejecuta src/robustness.py")
-        
-    st.subheader("Impacto en Transfer Learning a altos niveles de ruido")
-    col_r1, col_r2 = st.columns(2)
-    with col_r1:
-        try:
-            st.image(str(BASE_DIR / "results/confusion_matrix_transfer_10dB.png"), caption="Matriz Transfer a 10 dB")
-        except: pass
-    with col_r2:
-        try:
-            st.image(str(BASE_DIR / "results/confusion_matrix_transfer_0dB.png"), caption="Matriz Transfer a 0 dB")
-        except: pass
-
-# ── PESTAÑA 6: Simulación de Campo ───────────────────────────────────────────
-with tab6:
-    st.header("Simulación de Campo: Sistema Integrado")
-    st.write("""
-    El sistema actúa como un activador acústico inteligente para una cámara de seguridad. Permanece en un estado 
-    de **ESPERA** de muy bajo consumo energético analizando el entorno. Al detectar un evento peligroso que supera 
-    el umbral, pasa a **ALERTA** y dispara la **GRABACIÓN**. Gracias a un búfer circular, se compensa la latencia 
-    recuperando el audio de los instantes previos al evento.
-    """)
-    
-    col_g1, col_g2 = st.columns([1, 2])
-    with col_g1:
-        st.subheader("Máquina de Estados")
-        st.graphviz_chart('''
-            digraph {
-                node [shape=box, style=filled, color="#3b82f6", fontcolor=white, fontname="Helvetica", border=0, penwidth=0];
-                edge [fontname="Helvetica", fontsize=10, color="gray"];
-                ESPERA -> ALERTA [label=" evento sospechoso > umbral"];
-                ALERTA -> GRABACION [label=" volcado de búfer (10s)"];
-                GRABACION -> ESPERA [label=" fin de evento"];
-            }
-        ''')
-        
-    with col_g2:
-        st.subheader("Métricas de Rendimiento y Eficiencia")
-        try:
-            df_sim = load_resultados_simulacion()
-            carpeta_alertas = BASE_DIR / "test_simulacion" / "alertas_detectadas"
+            # Filtramos solo las clases que superan un mínimo en al menos uno de los modelos para no saturar
+            df_comp = df_comp[(df_comp["Prob_Transfer"] > 0.05) | (df_comp["Prob_CNN"] > 0.05)]
             
-            # Contar alertas reales disparadas leyendo los ficheros .wav generados
-            alertas_archivos = list(carpeta_alertas.glob("*.wav")) if carpeta_alertas.exists() else []
-            num_alertas = len(alertas_archivos)
-            
-            # Cálculo de eficiencia (Asumimos 180s totales)
-            tiempo_total = 180.0
-            tiempo_grabacion = num_alertas * 10.0 # 10s por alerta
-            tiempo_espera = max(0.0, tiempo_total - tiempo_grabacion)
-            pct_ahorro = (tiempo_espera / tiempo_total) * 100
-            
-            latencia_media = df_sim["latencia_s"].mean()
-            
-            # Mostrar métricas en columnas
-            m1, m2, m3 = st.columns(3)
-            m1.metric("% Tiempo en ahorro (ESPERA)", f"{pct_ahorro:.1f}%")
-            m2.metric("Nº Alertas disparadas", str(num_alertas))
-            m3.metric("Latencia media de detección", f"{latencia_media:.2f} s" if pd.notna(latencia_media) else "N/A")
-            
-            # Mostrar tasa de detección
-            total_eventos = len(df_sim)
-            detectados = int(df_sim["detectado"].sum())
-            falsos_positivos = max(0, num_alertas - detectados)
-            
-            st.write(f"**Tasa de Detección:** {detectados}/{total_eventos} eventos reales detectados. **Falsos Positivos:** {falsos_positivos}")
-            
-            st.subheader("Registro de Eventos (Ground Truth vs Detección)")
-            st.dataframe(df_sim, use_container_width=True)
-            
-        except FileNotFoundError:
-            st.warning("No se encontraron resultados de la simulación. Ejecuta simulacion_campo.py primero.")
-            
-    st.divider()
-    st.subheader("Visor de Alertas Detectadas")
-    try:
-        carpeta_alertas = BASE_DIR / "test_simulacion" / "alertas_detectadas"
-        if carpeta_alertas.exists():
-            imgs_alertas = list(carpeta_alertas.glob("*.png"))
-            if imgs_alertas:
-                img_nombres = [img.name for img in imgs_alertas]
-                seleccion = st.selectbox("Selecciona una alerta capturada para visualizar el espectrograma (10s de búfer):", img_nombres)
-                st.image(str(carpeta_alertas / seleccion), use_container_width=True)
+            if df_comp.empty:
+                st.write("Ninguna clase superó el umbral de 5% de probabilidad.")
             else:
-                st.info("No se han generado alertas visuales en la carpeta.")
+                fig = go.Figure(data=[
+                    go.Bar(name='Transfer Learning (PANNs)', x=df_comp['Clase'], y=df_comp['Prob_Transfer'], marker_color='#3b82f6'),
+                    go.Bar(name='CNN (Entrenada desde cero)', x=df_comp['Clase'], y=df_comp['Prob_CNN'], marker_color='#94a3b8')
+                ])
+                fig.update_layout(barmode='group', title="Probabilidad Media Asignada a las Clases Destacadas", yaxis_title="Probabilidad")
+                st.plotly_chart(fig, use_container_width=True)
+
+# ── PESTAÑA 3: Explorador de Espectrogramas ──────────────────────────────────
+with tab3:
+    st.header("Forma de Onda y Espectrograma del Audio Actual")
+    if not audio_cargado:
+        st.info("Sube o graba un audio en la pestaña 'Prueba en Vivo' y pulsa en 'Analizar Audio'.")
+    else:
+        y = st.session_state["audio_y"]
+        sr = st.session_state["audio_sr"]
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Forma de Onda (Waveform)")
+            fig_wave, ax_wave = plt.subplots(figsize=(10, 4))
+            librosa.display.waveshow(y, sr=sr, ax=ax_wave, color="#3b82f6")
+            ax_wave.set_title("Amplitud de la señal")
+            st.pyplot(fig_wave)
+            
+        with col2:
+            st.subheader("Espectrograma Log-Mel")
+            # Para visualizar mejor, pasamos a 22kHz como usa la CNN base
+            sig_22k = librosa.resample(y, orig_sr=sr, target_sr=22050)
+            logmel = compute_logmel(sig_22k)
+            
+            fig_mel, ax_mel = plt.subplots(figsize=(10, 4))
+            img = librosa.display.specshow(logmel, sr=22050, hop_length=512, x_axis='time', cmap='magma', ax=ax_mel)
+            ax_mel.set_title("Energía por Banda de Frecuencia")
+            fig_mel.colorbar(img, ax=ax_mel, format="%+2.0f dB")
+            st.pyplot(fig_mel)
+
+# ── PESTAÑA 4: Modelo CNN ────────────────────────────────────────────────────
+with tab4:
+    st.header("Análisis a lo Largo del Tiempo: CNN (Desde Cero)")
+    if not audio_cargado:
+        st.info("Sube o graba un audio en la pestaña 'Prueba en Vivo' y pulsa en 'Analizar Audio'.")
+    else:
+        res_cnn = st.session_state["res_cnn"]
+        if not res_cnn:
+            st.warning("No se encuentra el modelo CNN base.")
         else:
-            st.info("La carpeta de alertas no existe aún.")
-    except Exception as e:
-        st.warning(f"No se pudo cargar la visualización de alertas: {e}")
+            fig = plot_probs_over_time(res_cnn, "Probabilidades de la CNN a lo Largo del Audio", "cnn")
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+
+# ── PESTAÑA 5: Modelo Transfer Learning ──────────────────────────────────────
+with tab5:
+    st.header("Análisis a lo Largo del Tiempo: Transfer Learning")
+    if not audio_cargado:
+        st.info("Sube o graba un audio en la pestaña 'Prueba en Vivo' y pulsa en 'Analizar Audio'.")
+    else:
+        res_tf = st.session_state["res_tf"]
+        fig = plot_probs_over_time(res_tf, "Probabilidades del Transfer Learning a lo Largo del Audio", "tf")
+        if fig:
+            st.plotly_chart(fig, use_container_width=True)
+
+# ── PESTAÑA 6: Robustez ──────────────────────────────────────────────────────
+with tab6:
+    st.header("Prueba de Robustez ante Ruido Ambiental (AWGN)")
+    if not audio_cargado:
+        st.info("Sube o graba un audio en la pestaña 'Prueba en Vivo' y pulsa en 'Analizar Audio'.")
+    else:
+        st.write("Selecciona un nivel de ruido para añadir al audio actual y observa cómo cambian las detecciones del modelo Transfer Learning.")
+        
+        snr_sel = st.select_slider("Nivel de Ruido a Inyectar (SNR):", options=["Limpio", "20", "10", "0"])
+        
+        if st.button("Aplicar Ruido y Re-analizar"):
+            with st.spinner(f"Inyectando ruido (SNR={snr_sel} dB) y re-evaluando..."):
+                y_base = st.session_state["audio_y"]
+                sr_base = st.session_state["audio_sr"]
+                
+                res_tf_noisy, _, alertas_noisy, y_noisy = analyze_audio_buffer(y_base, sr_base, snr_sel)
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.subheader("Audio con Ruido Añadido")
+                    # Crear audio temporal en memoria para reproducirlo
+                    import io
+                    buf = io.BytesIO()
+                    sf.write(buf, y_noisy, sr_base, format='wav')
+                    buf.seek(0)
+                    st.audio(buf)
+                    
+                    if alertas_noisy:
+                        st.error(f"A pesar del ruido, se detectaron {len(alertas_noisy)} alertas.")
+                        for seg, clase, conf in alertas_noisy:
+                            st.warning(f"⚠️ **{clase.upper()}** (Confianza: {conf:.2f})")
+                    else:
+                        st.success("No se detectaron alertas.")
+                        
+                with col2:
+                    fig = plot_probs_over_time(res_tf_noisy, f"Probabilidades Transfer Learning con SNR {snr_sel} dB", f"noise_{snr_sel}")
+                    if fig:
+                        st.plotly_chart(fig, use_container_width=True)
+
