@@ -10,7 +10,7 @@ import numpy as np, pandas as pd, librosa
 import torch, torch.nn.functional as F
 
 warnings.filterwarnings("ignore")
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR / "src"))
 # pyrefly: ignore [missing-import]
 from datos_y_configuracion import CLASS_MAP
@@ -28,7 +28,7 @@ def main():
     if (BASE_DIR / "models/threshold.json").exists():
         theta = json.load(open(BASE_DIR / "models/threshold.json")).get("theta", 0.82)
 
-    panns = AudioTagging(checkpoint_path=str(BASE_DIR / "models/Cnn14_mAP=0.431.pth"), device=device)
+    panns = AudioTagging(checkpoint_path=str(BASE_DIR / "models/Cnn14_mAP=0.431.pth"), device=str(device))
     model = TransferHead(num_classes=len(CLASS_MAP)).to(device).eval()
     model.load_state_dict(torch.load(BASE_DIR / "models/transfer_head_best.pt", map_location=device, weights_only=True))
 
@@ -68,14 +68,26 @@ def main():
     gt = json.load(open(gt_path))
     res, det_libres = [], detecciones.copy()
     
+    clase_en_to_es = {
+        "glass_breaking": "rotura_cristal",
+        "gun_shot": "disparo",
+        "dog_bark": "ladrido_perro",
+        "siren": "sirena",
+        "crying_baby": "bebe_llorando",
+        "door_wood_knock": "llamar_puerta",
+        "screaming": "grito",
+        "background": "fondo"
+    }
+    
     for evt in gt:
-        seg, cl = evt["tiempo_inicio"], evt["clase"]
-        matches = [d for d in det_libres if d["clase"] == cl and seg <= d["segundo"] <= seg + 6.0]
+        seg, cl_en = evt["tiempo_inicio"], evt["clase"]
+        cl_es = clase_en_to_es.get(cl_en, cl_en)
+        matches = [d for d in det_libres if d["clase"] == cl_es and seg <= d["segundo"] <= seg + 6.0]
         if matches:
-            res.append({"real": cl, "segundo": seg, "detectado": True, "latencia": matches[0]["segundo"] - seg})
+            res.append({"real": cl_en, "segundo": seg, "detectado": True, "latencia": matches[0]["segundo"] - seg})
             for m in matches: det_libres.remove(m)
         else:
-            res.append({"real": cl, "segundo": seg, "detectado": False, "latencia": None})
+            res.append({"real": cl_en, "segundo": seg, "detectado": False, "latencia": None})
 
     csv_path = BASE_DIR / "results/resultados_simulacion.csv"
     pd.DataFrame(res).to_csv(csv_path, index=False)

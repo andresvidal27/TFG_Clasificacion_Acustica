@@ -58,7 +58,7 @@ def main():
     # 2. Cargar modelos
     print("[Info] Cargando redes neuronales...")
     from panns_inference import AudioTagging
-    panns = AudioTagging(checkpoint_path=str(BASE_DIR / "models/Cnn14_mAP=0.431.pth"), device=device)
+    panns = AudioTagging(checkpoint_path=str(BASE_DIR / "models/Cnn14_mAP=0.431.pth"), device=str(device))
     
     num_clases = len(CLASS_MAP)
     model = TransferHead(num_classes=num_clases).to(device).eval()

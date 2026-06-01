@@ -60,7 +60,7 @@ class DatasetEmbeddings(Dataset):
 # ==============================================================================
 def entrenar_transfer():
     """Bucle principal de entrenamiento para el clasificador Transfer Learning."""
-    print("Iniciando entrenamiento del modelo Transfer Learning (CNN14 Embeddings)...")
+    print("Iniciando entrenamiento del modelo Transfer Learning (con Data Augmentation)...")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     df = pd.read_csv(BASE_DIR / "dataset_index_emb.csv").dropna(subset=["embedding_path"])
@@ -78,11 +78,11 @@ def entrenar_transfer():
     model = TransferHead(num_classes).to(device)
     pesos_clase = calcular_pesos_clases(train_df["label_id"].values, num_classes, device)
     criterion = nn.CrossEntropyLoss(weight=pesos_clase)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=5e-5, weight_decay=1e-4)
 
     historial = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
     mejor_loss = float("inf")
-    paciencia, epochs_sin_mejora = 10, 0
+    paciencia, epochs_sin_mejora = 12, 0
     nombre_modelo = "transfer_head"
     ruta_guardado = BASE_DIR / "models" / f"{nombre_modelo}_best.pt"
     ruta_guardado.parent.mkdir(exist_ok=True)

@@ -85,7 +85,7 @@ def plot_inferencia():
         plt.title(f"F1 vs Umbral - {t}"); plt.savefig(RESULTS_DIR / f"threshold_analysis_{n_arch}.png"); plt.close()
 
     from panns_inference import AudioTagging
-    panns = AudioTagging(checkpoint_path=str(MODELS_DIR / "Cnn14_mAP=0.431.pth"), device=device)
+    panns = AudioTagging(checkpoint_path=str(MODELS_DIR / "Cnn14_mAP=0.431.pth"), device=str(device))
     for snr in [10, 0]:
         preds, targs = [], []
         for _, r in t_emb.iterrows():

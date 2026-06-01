@@ -1,5 +1,5 @@
-evento_real,segundo_real,detectado,clase_detectada,latencia_s,confianza
-glass_breaking,25.0,True,glass_breaking,0.0,0.98
-siren,60.0,True,siren,0.0,0.95
-screaming,95.0,True,screaming,0.0,0.97
-dog_bark,140.0,True,dog_bark,0.0,0.99
+real,segundo,detectado,latencia
+glass_breaking,25.0,True,0.0
+siren,60.0,True,0.0
+screaming,95.0,True,0.0
+dog_bark,140.0,True,0.0

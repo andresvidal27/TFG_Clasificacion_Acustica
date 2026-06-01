@@ -65,7 +65,7 @@ def main():
     # Robustez
     print("Analizando robustez SNR...")
     from panns_inference import AudioTagging
-    panns = AudioTagging(checkpoint_path=str(BASE_DIR / "models/Cnn14_mAP=0.431.pth"), device=device)
+    panns = AudioTagging(checkpoint_path=str(BASE_DIR / "models/Cnn14_mAP=0.431.pth"), device=str(device))
     res = []
     
     for snr, lbl in zip([None, 20, 15, 10, 5, 0], ["Limpio", "20 dB", "15 dB", "10 dB", "5 dB", "0 dB"]):

@@ -178,13 +178,13 @@ def precomputar_features_cnn(df: pd.DataFrame):
     return df
 
 def precomputar_embeddings_transfer(df: pd.DataFrame):
-    """Descarga el modelo PANNs y extrae los embeddings (2048 dims)."""
+    """Descarga el modelo PANNs y extrae los embeddings con Data Augmentation (2048 dims)."""
     out_csv = BASE_DIR / "dataset_index_emb.csv"
     if out_csv.exists():
         print(f"[Info] {out_csv.name} ya existe. Saltando embeddings Transfer.")
         return pd.read_csv(out_csv)
 
-    print("Precomputando Embeddings PANNs (Transfer Learning)...")
+    print("Precomputando Embeddings PANNs (con Data Augmentation)...")
     FEATURES_DIR.mkdir(exist_ok=True)
     MODELS_DIR.mkdir(exist_ok=True)
     ckpt_path = MODELS_DIR / "Cnn14_mAP=0.431.pth"
@@ -198,24 +198,67 @@ def precomputar_embeddings_transfer(df: pd.DataFrame):
         urllib.request.urlretrieve("https://raw.githubusercontent.com/qiuqiangkong/audioset_tagging_cnn/master/metadata/class_labels_indices.csv", str(csv_path))
 
     from panns_inference import AudioTagging
+    from tqdm import tqdm
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     at = AudioTagging(checkpoint_path=str(ckpt_path), device=device)
     
-    emb_paths = []
-    for idx, row in df.iterrows():
+    new_rows = []
+    print(f"Procesando audios y aplicando Data Augmentation...")
+    for idx, row in tqdm(df.iterrows(), total=len(df)):
+        filepath = row['filepath']
+        label_id = row['label_id']
+        label_name = row['label_name']
+        split = row['split']
+        source = row['source']
+        
         try:
-            audio, _ = librosa.load(row['filepath'], sr=32000, mono=True)
-            _, embedding = at.inference(audio[None, :])
-            path = FEATURES_DIR / f"emb_{row['label_id']}_{idx}.npy"
-            np.save(path, embedding[0])
-            emb_paths.append(str(path))
-        except Exception:
-            emb_paths.append("")
+            audio_orig, sr = librosa.load(filepath, sr=32000, mono=True)
             
-    df["embedding_path"] = emb_paths
-    df.to_csv(out_csv, index=False)
-    print("[OK] Embeddings generados.")
-    return df
+            # 1. Original
+            _, emb_orig = at.inference(audio_orig[None, :])
+            path_orig = FEATURES_DIR / f"emb_{label_id}_{idx}_orig.npy"
+            np.save(path_orig, emb_orig[0])
+            
+            new_rows.append({
+                "filepath": filepath, "label_id": label_id, "label_name": label_name,
+                "source": source, "split": split, "embedding_path": str(path_orig),
+                "augmentation": "none"
+            })
+            
+            # 2. Augmentation solo en train
+            if split == 'train':
+                # Ruido
+                signal_power = np.mean(audio_orig**2)
+                if signal_power > 0:
+                    snr_linear = 10 ** (10 / 10) # 10dB
+                    noise = np.random.normal(0, np.sqrt(signal_power / snr_linear), len(audio_orig))
+                    audio_noise = (audio_orig + noise).astype(np.float32)
+                    _, emb_noise = at.inference(audio_noise[None, :])
+                    path_noise = FEATURES_DIR / f"emb_{label_id}_{idx}_noise.npy"
+                    np.save(path_noise, emb_noise[0])
+                    new_rows.append({"filepath": filepath, "label_id": label_id, "label_name": label_name, "source": source, "split": split, "embedding_path": str(path_noise), "augmentation": "noise_10db"})
+                
+                # Pitch Up
+                audio_pitch = librosa.effects.pitch_shift(y=audio_orig, sr=sr, n_steps=2)
+                _, emb_pitch = at.inference(audio_pitch[None, :])
+                path_pitch = FEATURES_DIR / f"emb_{label_id}_{idx}_pitch_up.npy"
+                np.save(path_pitch, emb_pitch[0])
+                new_rows.append({"filepath": filepath, "label_id": label_id, "label_name": label_name, "source": source, "split": split, "embedding_path": str(path_pitch), "augmentation": "pitch_+2"})
+
+                # Pitch Down
+                audio_pitch_down = librosa.effects.pitch_shift(y=audio_orig, sr=sr, n_steps=-2)
+                _, emb_pitch_down = at.inference(audio_pitch_down[None, :])
+                path_pitch_down = FEATURES_DIR / f"emb_{label_id}_{idx}_pitch_down.npy"
+                np.save(path_pitch_down, emb_pitch_down[0])
+                new_rows.append({"filepath": filepath, "label_id": label_id, "label_name": label_name, "source": source, "split": split, "embedding_path": str(path_pitch_down), "augmentation": "pitch_-2"})
+
+        except Exception:
+            pass
+            
+    new_df = pd.DataFrame(new_rows)
+    new_df.to_csv(out_csv, index=False)
+    print(f"[OK] Creado dataset_index_emb con {len(new_df)} embeddings en {out_csv}.")
+    return new_df
 
 if __name__ == "__main__":
     df_base = generar_indice_dataset()

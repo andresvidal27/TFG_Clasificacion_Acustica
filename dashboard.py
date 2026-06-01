@@ -35,9 +35,9 @@ st.set_page_config(page_title="Dashboard Acústico", layout="wide")
 @st.cache_resource
 def load_models():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    panns = AudioTagging(checkpoint_path=str(BASE_DIR / "models/Cnn14_mAP=0.431.pth"), device=device)
+    panns = AudioTagging(checkpoint_path=str(BASE_DIR / "models/Cnn14_mAP=0.431.pth"), device=str(device))
     model_transfer = TransferHead(num_classes=len(CLASS_MAP)).to(device).eval()
-    model_transfer.load_state_dict(torch.load(BASE_DIR / "models_v2/transfer_mejorado_best.pt", map_location=device, weights_only=True))
+    model_transfer.load_state_dict(torch.load(BASE_DIR / "models/transfer_head_best.pt", map_location=device, weights_only=True))
     
     model_cnn = AudioCNN(num_classes=len(CLASS_MAP)).to(device).eval()
     try:
@@ -153,7 +153,7 @@ if "audio_y" in st.session_state:
             probs_cnn = min(st.session_state["res_cnn"], key=lambda r: abs(r["segundo"] - seg))["probs"] if st.session_state["res_cnn"] else np.zeros(len(CLASS_MAP))
 
         df = pd.DataFrame({"Transfer": probs_tf, "CNN": probs_cnn}, index=[CLASS_MAP[i] for i in range(len(CLASS_MAP))])
-        df_filt = df[df.max(axis=1) > 0.05].reset_index().rename(columns={"index": "Clase"}).melt(id_vars="Clase", var_name="Modelo", value_name="Prob")
+        df_filt = df.reset_index().rename(columns={"index": "Clase"}).melt(id_vars="Clase", var_name="Modelo", value_name="Prob")
         st.plotly_chart(px.bar(df_filt, x="Clase", y="Prob", color="Modelo", barmode="group", title=title), width="stretch")
         
     with tabs[2]:
