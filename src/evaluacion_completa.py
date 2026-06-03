@@ -94,7 +94,7 @@ def main():
             "rotura_cristal": 0.85,
             "disparo": 0.60,         # Muy sensible (menos estricto)
             "bebe_llorando": 0.85,
-            "llamar_puerta": 0.45,   # Extremadamente sensible (salta a la mínima sospecha)
+            "llamar_puerta": 0.45,   # Muy reducido para captar bien los golpes
             "grito": 0.80            # Reducido un poco para que sea más fácil detectar gritos
         },
         "min_rms_general": 0.025,    # Todo sonido debe tener al menos esta energía para ser analizado
