@@ -1,7 +1,10 @@
 """
 evaluacion_completa.py
 ----------------------
-Evalúa la precisión y robustez de los modelos entrenados.
+Este script carga los pesos finales entrenados de ambos modelos (CNN y Transfer Learning)
+y los evalúa frente al conjunto de TEST (datos que la red JAMÁS ha visto durante el entrenamiento).
+Genera reportes de clasificación detallados (F1, Precision, Recall) y Matrices de Confusión.
+Además, pone a prueba los modelos añadiéndoles diferentes niveles de ruido (Robustez).
 """
 import sys, json, warnings
 from pathlib import Path
@@ -13,25 +16,42 @@ import torch.nn.functional as F
 warnings.filterwarnings("ignore")
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR / "src"))
+
 from datos_y_configuracion import SR, preprocess_audio, compute_logmel, add_awgn, CLASS_MAP
 from entrenar_cnn import AudioCNN, DatasetEspectrogramas
 from entrenar_transfer import TransferHead, DatasetEmbeddings
 
 def eval_model(model, loader, device):
-    model.eval()
+    """
+    Pasa todos los datos de un Dataloader (habitualmente TEST) por un modelo
+    y recupera sus predicciones y probabilidades absolutas.
+    """
+    model.eval() # Modo evaluación (apaga Dropout, etc)
     targets, probs = [], []
     with torch.no_grad():
         for X, y in loader:
+            # Las salidas del modelo pasan por Softmax para convertirse en porcentajes de 0 a 1
             probs.append(F.softmax(model(X.to(device)), dim=1).cpu().numpy())
             targets.extend(y.numpy())
     probs = np.concatenate(probs)
+    # Devuelve (Las Etiquetas reales, Las Predicciones Elegidas, Las Probabilidades de las 8 clases)
     return np.array(targets), probs.argmax(1), probs
 
 def plot_cm(y_true, y_pred, clases, titulo, ruta):
+    """
+    Genera y guarda una Matriz de Confusión (Confusion Matrix) en formato imagen (PNG).
+    Permite ver visualmente qué clase se está confundiendo con qué otra.
+    """
     cm = confusion_matrix(y_true, y_pred)
     plt.figure(figsize=(8, 6))
-    sns.heatmap(cm.astype(float)/np.maximum(cm.sum(axis=1, keepdims=True), 1), annot=cm, fmt="d", cmap="Blues", xticklabels=clases, yticklabels=clases)
-    plt.title(titulo); plt.xticks(rotation=45, ha="right"); plt.tight_layout(); plt.savefig(ruta); plt.close()
+    # Normalizamos por fila (para ver los porcentajes de acierto sobre el total real de esa clase)
+    sns.heatmap(cm.astype(float)/np.maximum(cm.sum(axis=1, keepdims=True), 1), 
+                annot=cm, fmt="d", cmap="Blues", xticklabels=clases, yticklabels=clases)
+    plt.title(titulo)
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.savefig(ruta)
+    plt.close()
 
 def main():
     print("Iniciando Evaluación Completa...")
@@ -39,51 +59,69 @@ def main():
     out = BASE_DIR / "results"
     out.mkdir(exist_ok=True)
     
+    # Cargamos EXCLUSIVAMENTE los splits marcados como "test" en los índices precomputados
     df_cnn = pd.read_csv(BASE_DIR / "dataset_index_features.csv").dropna(subset=["feature_path"])
     df_emb = pd.read_csv(BASE_DIR / "dataset_index_emb.csv").dropna(subset=["embedding_path"])
     test_cnn = df_cnn[df_cnn["split"] == "test"].reset_index(drop=True)
     test_emb = df_emb[df_emb["split"] == "test"].reset_index(drop=True)
     clases = [CLASS_MAP[i] for i in range(len(CLASS_MAP))]
     
+    # Instanciamos los modelos vacíos en memoria
     cnn = AudioCNN(len(clases)).to(device)
-    cnn.load_state_dict(torch.load(BASE_DIR / "models/cnn_base_best.pt", weights_only=True, map_location=device))
     tf = TransferHead(len(clases)).to(device)
+    
+    # Cargamos los pesos guardados en disco por el Early Stopping de la fase de entrenamiento
+    cnn.load_state_dict(torch.load(BASE_DIR / "models/cnn_base_best.pt", weights_only=True, map_location=device))
     tf.load_state_dict(torch.load(BASE_DIR / "models/transfer_head_best.pt", weights_only=True, map_location=device))
     
     print("Evaluando en test limpio...")
+    # 1. Evaluamos la CNN Base y guardamos la Matriz de Confusión y su reporte CSV
     y_true_cnn, y_pred_cnn, _ = eval_model(cnn, DataLoader(DatasetEspectrogramas(test_cnn), batch_size=32), device)
     plot_cm(y_true_cnn, y_pred_cnn, clases, "Matriz Confusión CNN", out / "confusion_matrix_cnn.png")
     pd.DataFrame(classification_report(y_true_cnn, y_pred_cnn, target_names=clases, output_dict=True)).T.to_csv(out / "classification_report_cnn.csv")
     
+    # 2. Evaluamos Transfer Learning y guardamos la Matriz de Confusión y su reporte CSV
     y_true_tf, y_pred_tf, _ = eval_model(tf, DataLoader(DatasetEmbeddings(test_emb), batch_size=32), device)
     plot_cm(y_true_tf, y_pred_tf, clases, "Matriz Confusión Transfer", out / "confusion_matrix_transfer.png")
     pd.DataFrame(classification_report(y_true_tf, y_pred_tf, target_names=clases, output_dict=True)).T.to_csv(out / "classification_report_transfer.csv")
     
-    # Umbral
+    # Guardamos un Umbral duro por defecto para luego usarlo en la app en tiempo real (0.85)
     json.dump({"theta": 0.85}, open(BASE_DIR / "models/threshold.json", "w"))
 
-    # Robustez
+    # ==============================================================================
+    # ANÁLISIS DE ROBUSTEZ FRENTE A RUIDO AMBIENTAL (AWGN)
+    # ==============================================================================
     print("Analizando robustez SNR...")
     from panns_inference import AudioTagging
+    # Re-cargamos PANNs para procesar audios en crudo, porque les meteremos ruido artificial
     panns = AudioTagging(checkpoint_path=str(BASE_DIR / "models/Cnn14_mAP=0.431.pth"), device=str(device))
     res = []
     
+    # Simulamos degradación de audio. 20 dB = ruido muy leve, 0 dB = ruido igual de fuerte que la señal
     for snr, lbl in zip([None, 20, 15, 10, 5, 0], ["Limpio", "20 dB", "15 dB", "10 dB", "5 dB", "0 dB"]):
         print(f" -> Evaluando {lbl}...")
         targs, p_cnn, p_tf = [], [], []
         with torch.no_grad():
             for _, r in test_cnn.iterrows():
                 try:
+                    # Aplicamos ruido sobre la marcha y lo pasamos por Transfer Learning (PANNs -> Head)
                     s_32 = add_awgn(librosa.load(r['filepath'], sr=32000, mono=True)[0], snr)
                     p_tf.append(tf(torch.from_numpy(panns.inference(s_32[None, :])[1][0]).float().unsqueeze(0).to(device)).argmax(1).item())
+                    
+                    # Aplicamos ruido sobre la marcha, hacemos el logmel y lo pasamos por CNN Base
                     s_22 = add_awgn(preprocess_audio(r['filepath']), snr)
                     p_cnn.append(cnn(torch.from_numpy(compute_logmel(s_22)).float().unsqueeze(0).unsqueeze(0).to(device)).argmax(1).item())
+                    
                     targs.append(r['label_id'])
                 except Exception: pass
+        
+        # Almacenamos el F1-Macro resultante en esa situación de ruido particular
         res.extend([
             {"modelo": "CNN", "snr_label": lbl, "snr_x": 25 if snr is None else snr, "f1": f1_score(targs, p_cnn, average='macro', zero_division=0)},
             {"modelo": "Transfer Learning", "snr_label": lbl, "snr_x": 25 if snr is None else snr, "f1": f1_score(targs, p_tf, average='macro', zero_division=0)}
         ])
+    
+    # Guardamos el análisis de degradación acústica en un CSV para luego graficarlo
     pd.DataFrame(res).to_csv(out / "robustness_snr.csv", index=False)
     print("¡Evaluación completada con éxito!")
 
