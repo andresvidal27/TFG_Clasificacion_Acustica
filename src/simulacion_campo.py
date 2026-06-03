@@ -27,9 +27,20 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # 1. Recuperar el umbral óptimo (Threshold) que calculó 'evaluacion_completa.py'
-    theta = 0.82
+    theta = 0.85
+    thresholds_por_clase = {}
+    min_rms_general = 0.025
+    min_rms_por_clase = {}
     if (BASE_DIR / "models/threshold.json").exists():
-        theta = json.load(open(BASE_DIR / "models/threshold.json")).get("theta", 0.82)
+        try:
+            with open(BASE_DIR / "models/threshold.json") as f:
+                data = json.load(f)
+                theta = data.get("theta", 0.85)
+                thresholds_por_clase = data.get("thresholds_por_clase", {})
+                min_rms_general = data.get("min_rms_general", 0.025)
+                min_rms_por_clase = data.get("min_rms_por_clase", {})
+        except Exception:
+            pass
 
     # 2. Cargar los modelos pre-entrenados
     # Usamos explícitamente Transfer Learning por ser el modelo más robusto
@@ -74,7 +85,17 @@ def main():
         elif 60 <= segundo <= 65: pred, conf = "sirena", 0.95
         elif 95 <= segundo <= 100: pred, conf = "grito", 0.97
         elif 140 <= segundo <= 145: pred, conf = "ladrido_perro", 0.99
-        elif not (pred in clases_alerta and conf >= theta): pred = "fondo" # Forzar a fondo si no supera umbral
+        
+        # Lógica de Umbral por clase para ajustar sensibilidad
+        t_clase = thresholds_por_clase.get(pred, theta)
+        if not (pred in clases_alerta and conf >= t_clase):
+            pred = "fondo" # Forzar a fondo si no supera umbral
+        elif pred in clases_alerta:
+            # Filtros de volumen general y por clase para requerir más potencia acústica
+            rms = np.sqrt(np.mean(buffer**2))
+            rms_req = min_rms_por_clase.get(pred, min_rms_general)
+            if rms < rms_req:
+                pred = "fondo"
 
         # 4c. Lógica de Disparo de Alerta (Alarm Trigger)
         if pred in clases_alerta and conf >= theta:

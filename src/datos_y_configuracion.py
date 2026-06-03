@@ -45,7 +45,6 @@ HOP_LENGTH = 512         # Cuánto avanza la ventana de Fourier en el tiempo
 N_MELS = 128             # Número de bandas de frecuencia Mel en el espectrograma (eje Y)
 FMIN = 20                # Frecuencia mínima audible
 FMAX = 11025             # Frecuencia máxima (Nyquist = SR / 2)
-
 SEED = 42                # Semilla para que los splits de datos sean reproducibles siempre de la misma forma
 
 # Mapa central de Clases (Id -> Nombre). Cualquier audio que no encaje en los primeros 7 será "fondo".
@@ -75,7 +74,7 @@ def preprocess_audio(filepath: str) -> np.ndarray:
         signal = signal / max_val
     return signal.astype(np.float32)
 
-def compute_logmel(signal: np.ndarray) -> np.ndarray:
+def compute_logmel(signal: np.ndarray) -> np.ndarray: 
     """Calcula el espectrograma Mel y le aplica logaritmo para simular el oído humano."""
     # S contiene la "energía" de las frecuencias. Forma: [N_MELS, Tiempos]
     S = librosa.feature.melspectrogram(
@@ -125,38 +124,36 @@ def generar_indice_dataset():
         rows.append({"filepath": str(DATA_ESC50_DIR / "audio" / r["filename"]), "label_id": NAME_TO_ID["llamar_puerta"], "label_name": "llamar_puerta", "source": "esc50"})
 
     # 2. Clases compartidas entre ESC-50 y UrbanSound (Perros y Sirenas)
-    # Se limitan las muestras de UrbanSound para que no opaquen al resto del dataset (máx 300 sumando ambos).
+    # Usamos todas las muestras de UrbanSound para maximizar robustez.
     for cat_esc, cat_urb, label in [("dog", "dog_bark", "ladrido_perro"), ("siren", "siren", "sirena")]:
         esc_subset = esc50[esc50["category"] == cat_esc]
         for _, r in esc_subset.iterrows():
             rows.append({"filepath": str(DATA_ESC50_DIR / "audio" / r["filename"]), "label_id": NAME_TO_ID[label], "label_name": label, "source": "esc50"})
-        urb_subset = urban[urban["class"] == cat_urb].copy()
-        if len(urb_subset) > (300 - len(esc_subset)): 
-            urb_subset = urb_subset.sample(n=(300 - len(esc_subset)), random_state=SEED)
+        urb_subset = urban[urban["class"] == cat_urb]
         for _, r in urb_subset.iterrows():
             rows.append({"filepath": str(DATA_URBAN_DIR / f"fold{r['fold']}" / r["slice_file_name"]), "label_id": NAME_TO_ID[label], "label_name": label, "source": "urban"})
 
     # 3. Disparos (Gun shot, exclusivo UrbanSound)
-    urb_gun = urban[urban["class"] == "gun_shot"].sample(n=300, random_state=SEED) if len(urban[urban["class"] == "gun_shot"]) > 300 else urban[urban["class"] == "gun_shot"]
+    urb_gun = urban[urban["class"] == "gun_shot"]
     for _, r in urb_gun.iterrows():
         rows.append({"filepath": str(DATA_URBAN_DIR / f"fold{r['fold']}" / r["slice_file_name"]), "label_id": NAME_TO_ID["disparo"], "label_name": "disparo", "source": "urban"})
 
     # 4. Clase BACKGROUND (fondo). Son sonidos "basura" que ignoramos (viento, motor, silencio, etc.)
-    # Esto le enseña al modelo a NO alarmarse constantemente.
+    # Aumentamos el fondo a 200 de ESC-50 y 500 de UrbanSound para equilibrar
     esc50_used_cats = ["glass_breaking", "crying_baby", "door_wood_knock", "dog", "siren"]
-    esc50_bg = esc50[~esc50["category"].isin(esc50_used_cats)].sample(n=150, random_state=SEED)
+    esc50_bg = esc50[~esc50["category"].isin(esc50_used_cats)].sample(n=200, random_state=SEED)
     for _, r in esc50_bg.iterrows():
         rows.append({"filepath": str(DATA_ESC50_DIR / "audio" / r["filename"]), "label_id": NAME_TO_ID["fondo"], "label_name": "fondo", "source": "esc50"})
 
     urban_used_cats = ["dog_bark", "siren", "gun_shot"]
-    urban_bg = urban[~urban["class"].isin(urban_used_cats)].sample(n=150, random_state=SEED)
+    urban_bg = urban[~urban["class"].isin(urban_used_cats)].sample(n=500, random_state=SEED)
     for _, r in urban_bg.iterrows():
         rows.append({"filepath": str(DATA_URBAN_DIR / f"fold{r['fold']}" / r["slice_file_name"]), "label_id": NAME_TO_ID["fondo"], "label_name": "fondo", "source": "urban"})
 
     # 5. Gritos (Grabados aparte)
     gritos_dir = DATA_ESC50_DIR / "gritos"
     if gritos_dir.exists():
-        gritos = [{"filepath": str(f), "label_id": NAME_TO_ID["grito"], "label_name": "grito", "source": "esc50"} for f in list(gritos_dir.glob("*.wav"))[:300]]
+        gritos = [{"filepath": str(f), "label_id": NAME_TO_ID["grito"], "label_name": "grito", "source": "esc50"} for f in list(gritos_dir.glob("*.wav"))]
         rows.extend(gritos)
 
     df = pd.DataFrame(rows)
@@ -236,8 +233,11 @@ def precomputar_embeddings_transfer(df: pd.DataFrame):
     # Instanciamos PANNs. Nótese que esto carga la red en la memoria (RAM o VRAM de GPU)
     at = AudioTagging(checkpoint_path=str(ckpt_path), device=device)
     
+    # Calcular conteos por clase en Train para Sobremuestreo Dinámico
+    train_counts = df[df["split"] == "train"]["label_id"].value_counts().to_dict()
+    
     new_rows = []
-    print(f"Procesando audios y aplicando Data Augmentation...")
+    print(f"Procesando audios y aplicando Data Augmentation dinámico...")
     for idx, row in tqdm(df.iterrows(), total=len(df)):
         filepath = row['filepath']
         label_id = row['label_id']
@@ -261,32 +261,42 @@ def precomputar_embeddings_transfer(df: pd.DataFrame):
             })
             
             # --- 2. Data Augmentation (OBLIGATORIAMENTE SÓLO AL CONJUNTO TRAIN) ---
-            # Si tocamos Val o Test, haríamos trampa falseando los resultados.
             if split == 'train':
-                # a) Ruido (+10 dB SNR)
-                signal_power = np.mean(audio_orig**2)
-                if signal_power > 0:
-                    snr_linear = 10 ** (10 / 10) # 10dB
-                    noise = np.random.normal(0, np.sqrt(signal_power / snr_linear), len(audio_orig))
-                    audio_noise = (audio_orig + noise).astype(np.float32)
-                    _, emb_noise = at.inference(audio_noise[None, :])
-                    path_noise = FEATURES_DIR / f"emb_{label_id}_{idx}_noise.npy"
-                    np.save(path_noise, emb_noise[0])
-                    new_rows.append({"filepath": filepath, "label_id": label_id, "label_name": label_name, "source": source, "split": split, "embedding_path": str(path_noise), "augmentation": "noise_10db"})
+                class_count = train_counts.get(label_id, 0)
                 
-                # b) Pitch Shift Up (Aumentar el tono en 2 semi-tonos)
-                audio_pitch = librosa.effects.pitch_shift(y=audio_orig, sr=sr, n_steps=2)
-                _, emb_pitch = at.inference(audio_pitch[None, :])
-                path_pitch = FEATURES_DIR / f"emb_{label_id}_{idx}_pitch_up.npy"
-                np.save(path_pitch, emb_pitch[0])
-                new_rows.append({"filepath": filepath, "label_id": label_id, "label_name": label_name, "source": source, "split": split, "embedding_path": str(path_pitch), "augmentation": "pitch_+2"})
-
-                # c) Pitch Shift Down (Bajar el tono en 2 semi-tonos)
-                audio_pitch_down = librosa.effects.pitch_shift(y=audio_orig, sr=sr, n_steps=-2)
-                _, emb_pitch_down = at.inference(audio_pitch_down[None, :])
-                path_pitch_down = FEATURES_DIR / f"emb_{label_id}_{idx}_pitch_down.npy"
-                np.save(path_pitch_down, emb_pitch_down[0])
-                new_rows.append({"filepath": filepath, "label_id": label_id, "label_name": label_name, "source": source, "split": split, "embedding_path": str(path_pitch_down), "augmentation": "pitch_-2"})
+                # Definir cuántas y cuáles variaciones hacer en base a la escasez de la clase
+                if class_count < 100:
+                    augs = [
+                        ("noise_10db", lambda y: add_awgn(y, 10)),
+                        ("noise_5db", lambda y: add_awgn(y, 5)),
+                        ("pitch_+2", lambda y: librosa.effects.pitch_shift(y=y, sr=sr, n_steps=2)),
+                        ("pitch_-2", lambda y: librosa.effects.pitch_shift(y=y, sr=sr, n_steps=-2)),
+                        ("pitch_+1", lambda y: librosa.effects.pitch_shift(y=y, sr=sr, n_steps=1)),
+                        ("pitch_-1", lambda y: librosa.effects.pitch_shift(y=y, sr=sr, n_steps=-1)),
+                        ("noise_15_p_+2", lambda y: librosa.effects.pitch_shift(y=add_awgn(y, 15), sr=sr, n_steps=2)),
+                        ("noise_15_p_-2", lambda y: librosa.effects.pitch_shift(y=add_awgn(y, 15), sr=sr, n_steps=-2))
+                    ]
+                elif class_count < 400:
+                    augs = [
+                        ("noise_10db", lambda y: add_awgn(y, 10)),
+                        ("pitch_+2", lambda y: librosa.effects.pitch_shift(y=y, sr=sr, n_steps=2)),
+                        ("pitch_-2", lambda y: librosa.effects.pitch_shift(y=y, sr=sr, n_steps=-2))
+                    ]
+                else:
+                    augs = [
+                        ("noise_15db", lambda y: add_awgn(y, 15)) # Solo 1 variación leve para clases muy pobladas
+                    ]
+                    
+                for aug_name, aug_fn in augs:
+                    audio_aug = aug_fn(audio_orig).astype(np.float32)
+                    _, emb_aug = at.inference(audio_aug[None, :])
+                    path_aug = FEATURES_DIR / f"emb_{label_id}_{idx}_{aug_name}.npy"
+                    np.save(path_aug, emb_aug[0])
+                    new_rows.append({
+                        "filepath": filepath, "label_id": label_id, "label_name": label_name, 
+                        "source": source, "split": split, "embedding_path": str(path_aug), 
+                        "augmentation": aug_name
+                    })
 
         except Exception:
             pass

@@ -59,19 +59,29 @@ def load_models():
         model_cnn = None
 
     # 4. Umbral (Theta) para las alertas
-    theta = 0.5
+    theta = 0.85
+    thresholds_por_clase = {}
+    min_rms_general = 0.025
+    min_rms_por_clase = {}
     if (BASE_DIR / "models/threshold.json").exists():
-        with open(BASE_DIR / "models/threshold.json") as f:
-            theta = json.load(f).get("theta", 0.82)
+        try:
+            with open(BASE_DIR / "models/threshold.json") as f:
+                data = json.load(f)
+                theta = data.get("theta", 0.85)
+                thresholds_por_clase = data.get("thresholds_por_clase", {})
+                min_rms_general = data.get("min_rms_general", 0.025)
+                min_rms_por_clase = data.get("min_rms_por_clase", {})
+        except Exception:
+            pass
             
-    return panns, model_transfer, model_cnn, device, theta
+    return panns, model_transfer, model_cnn, device, theta, thresholds_por_clase, min_rms_general, min_rms_por_clase
 
 def analyze_audio_buffer(y, sr, snr=None):
     """
     Toma una señal cruda de audio de cualquier tamaño, la divide en ventanas de 5s 
     solapadas, y extrae las predicciones temporales completas.
     """
-    panns, model_transfer, model_cnn, device, theta = load_models()
+    panns, model_transfer, model_cnn, device, theta, thresholds_por_clase, min_rms_general, min_rms_por_clase = load_models()
     
     # Si el usuario selecciona añadir ruido artificial desde la interfaz
     if snr and snr != "Limpio": y = add_awgn(y, int(snr))
@@ -102,10 +112,17 @@ def analyze_audio_buffer(y, sr, snr=None):
                 max_prob = np.max(probs_tf)
                 segunda_prob = np.sort(probs_tf)[-2]
                 
-                # Regla Estricta: 
-                # a) O bien supera el Theta (ej 0.85)
-                # b) O bien supera 0.70 pero la diferencia respecto a la segunda clase es enorme (muy seguro)
-                if (max_prob >= theta) or (max_prob >= 0.70 and (max_prob - segunda_prob) >= 0.30):
+                # Regla Estricta por clase para ajustar sensibilidad
+                t_clase = thresholds_por_clase.get(clase_pred, theta)
+                # a) O bien supera el t_clase (ej 0.93 para perro/sirena, 0.82 para el resto)
+                # b) O bien supera (t_clase - 0.15) pero la diferencia respecto a la segunda clase es enorme (muy seguro)
+                if (max_prob >= t_clase) or (max_prob >= (t_clase - 0.15) and (max_prob - segunda_prob) >= 0.30):
+                    # Filtros de volumen general y por clase para requerir más potencia acústica
+                    rms = np.sqrt(np.mean(bloque**2))
+                    rms_req = min_rms_por_clase.get(clase_pred, min_rms_general)
+                    if rms < rms_req:
+                        continue
+                        
                     # Control anti-spam
                     if not any(c == clase_pred and (segundo - s) <= 3.0 for s, c, _ in alertas):
                         alertas.append((segundo, clase_pred, max_prob))
@@ -211,13 +228,26 @@ if "audio_y" in st.session_state:
         st.pyplot(fig)
         
     with tabs[3]: # Timeline de la CNN
-        st.plotly_chart(plot_probs(st.session_state["res_cnn"], "CNN"), width="stretch")
+        fig_cnn = plot_probs(st.session_state.get("res_cnn", []), "CNN")
+        if fig_cnn:
+            st.plotly_chart(fig_cnn, use_container_width=True)
+        else:
+            st.info("No hay datos generados para la CNN.")
     with tabs[4]: # Timeline de Transfer Learning
-        st.plotly_chart(plot_probs(st.session_state["res_tf"], "Transfer"), width="stretch")
+        fig_tf = plot_probs(st.session_state.get("res_tf", []), "Transfer")
+        if fig_tf:
+            st.plotly_chart(fig_tf, use_container_width=True)
+        else:
+            st.info("No hay datos generados para Transfer Learning.")
     with tabs[5]: # Simulación de Ruido en Vivo
         snr = st.select_slider("SNR", ["Limpio", "20", "10", "0"])
         if st.button("Aplicar Ruido"):
             res, _, alertas, y_n = analyze_audio_buffer(y, sr, snr)
             if alertas:
                 for seg, cl, conf in alertas: st.warning(f"⚠️ {cl.upper()} a los {seg:.1f}s ({conf:.2f})")
-            st.plotly_chart(plot_probs(res, f"Transfer con Ruido {snr}dB"), width="stretch")
+            
+            fig_noise = plot_probs(res, f"Transfer con Ruido {snr}dB")
+            if fig_noise:
+                st.plotly_chart(fig_noise, use_container_width=True)
+            else:
+                st.info("No hay datos suficientes para mostrar la gráfica.")

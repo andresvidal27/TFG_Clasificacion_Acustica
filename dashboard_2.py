@@ -46,15 +46,26 @@ def load_models():
     except Exception:
         model_cnn = None
 
-    theta = 0.5
+    # Umbral (Theta) para las alertas
+    theta = 0.85
+    thresholds_por_clase = {}
+    min_rms_general = 0.025
+    min_rms_por_clase = {}
     if (BASE_DIR / "models/threshold.json").exists():
-        with open(BASE_DIR / "models/threshold.json") as f:
-            theta = json.load(f).get("theta", 0.82)
+        try:
+            with open(BASE_DIR / "models/threshold.json") as f:
+                data = json.load(f)
+                theta = data.get("theta", 0.85)
+                thresholds_por_clase = data.get("thresholds_por_clase", {})
+                min_rms_general = data.get("min_rms_general", 0.025)
+                min_rms_por_clase = data.get("min_rms_por_clase", {})
+        except Exception:
+            pass
             
-    return panns, model_transfer, model_cnn, device, theta
+    return panns, model_transfer, model_cnn, device, theta, thresholds_por_clase, min_rms_general, min_rms_por_clase
 
 def analyze_audio_buffer(y, sr, snr=None):
-    panns, model_transfer, model_cnn, device, theta = load_models()
+    panns, model_transfer, model_cnn, device, theta, thresholds_por_clase, min_rms_general, min_rms_por_clase = load_models()
     if snr and snr != "Limpio": y = add_awgn(y, int(snr))
         
     ventana, avance = int(5.0 * sr), int(2.5 * sr)
@@ -78,8 +89,15 @@ def analyze_audio_buffer(y, sr, snr=None):
                 max_prob = np.max(probs_tf)
                 segunda_prob = np.sort(probs_tf)[-2]
                 
-                # Regla: Supera el umbral (theta) O (es mayor a 0.70 y le saca al menos 0.30 de diferencia a la segunda clase)
-                if (max_prob >= theta) or (max_prob >= 0.70 and (max_prob - segunda_prob) >= 0.30):
+                # Regla: Supera el umbral (t_clase) O (es mayor a (t_clase - 0.15) y le saca al menos 0.30 de diferencia a la segunda clase)
+                t_clase = thresholds_por_clase.get(clase_pred, theta)
+                if (max_prob >= t_clase) or (max_prob >= (t_clase - 0.15) and (max_prob - segunda_prob) >= 0.30):
+                    # Filtros de volumen general y por clase para requerir más potencia acústica
+                    rms = np.sqrt(np.mean(bloque**2))
+                    rms_req = min_rms_por_clase.get(clase_pred, min_rms_general)
+                    if rms < rms_req:
+                        continue
+                        
                     if not any(c == clase_pred and (segundo - s) <= 3.0 for s, c, _ in alertas):
                         alertas.append((segundo, clase_pred, max_prob))
                 

@@ -113,7 +113,8 @@ def calcular_pesos_clases(etiquetas, num_classes, device):
     se multiplica por un número mayor.
     """
     conteos = np.bincount(etiquetas, minlength=num_classes).astype(float)
-    pesos = len(etiquetas) / (num_classes * conteos)
+    # Suavizado de pesos usando raíz cuadrada para evitar inestabilidad en desbalances extremos
+    pesos = len(etiquetas) / (num_classes * np.sqrt(conteos))
     return torch.FloatTensor(pesos).to(device)
 
 def entrenar_cnn(con_ruido=False):

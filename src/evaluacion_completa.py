@@ -85,8 +85,29 @@ def main():
     plot_cm(y_true_tf, y_pred_tf, clases, "Matriz Confusión Transfer", out / "confusion_matrix_transfer.png")
     pd.DataFrame(classification_report(y_true_tf, y_pred_tf, target_names=clases, output_dict=True)).T.to_csv(out / "classification_report_transfer.csv")
     
-    # Guardamos un Umbral duro por defecto para luego usarlo en la app en tiempo real (0.85)
-    json.dump({"theta": 0.85}, open(BASE_DIR / "models/threshold.json", "w"))
+    # Guardamos un Umbral duro por defecto y umbrales específicos por clase para calibrar la sensibilidad
+    threshold_data = {
+        "theta": 0.85, # Subimos la exigencia general probabilística (señales más fuertes)
+        "thresholds_por_clase": {
+            "sirena": 0.95,          # Mucha seguridad
+            "ladrido_perro": 0.95,   
+            "rotura_cristal": 0.85,
+            "disparo": 0.60,         # Muy sensible (menos estricto)
+            "bebe_llorando": 0.85,
+            "llamar_puerta": 0.45,   # Extremadamente sensible (salta a la mínima sospecha)
+            "grito": 0.80            # Reducido un poco para que sea más fácil detectar gritos
+        },
+        "min_rms_general": 0.025,    # Todo sonido debe tener al menos esta energía para ser analizado
+        "min_rms_por_clase": {
+            "grito": 0.065,          # Bajado el límite físico de grito para que salte sin tener que reventar el micro
+            "sirena": 0.040,         # Exigencia alta
+            "disparo": 0.035,        # Un disparo lejano puede tener menos energía física (menos estricto)
+            "rotura_cristal": 0.035,
+            "ladrido_perro": 0.030,
+            "llamar_puerta": 0.010   # Exigencia casi nula de volumen, los golpes son sutiles
+        }
+    }
+    json.dump(threshold_data, open(BASE_DIR / "models/threshold.json", "w"))
 
     # ==============================================================================
     # ANÁLISIS DE ROBUSTEZ FRENTE A RUIDO AMBIENTAL (AWGN)
