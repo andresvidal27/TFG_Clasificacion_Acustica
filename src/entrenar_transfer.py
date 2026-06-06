@@ -4,7 +4,7 @@ entrenar_transfer.py
 Define la arquitectura de la cabeza clasificadora (TransferHead) y el código
 para entrenarla usando los embeddings extraídos por el modelo PANNs CNN14.
 Esto es Transfer Learning: aprovechamos un modelo ya preentrenado con millones de 
-audios (PANNs) que nos da un vector matemático (embedding) muy rico de 2048 dimensiones.
+audios (PANNs) que nos da un vector matemático (embedding) de 2048 dimensiones.
 Nosotros solo entrenamos esta pequeña red (cabeza) para que traduzca ese vector a nuestras 8 clases.
 """
 

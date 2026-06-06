@@ -3,7 +3,7 @@ simulacion_campo.py
 -------------------
 Demo principal del TFG que simula el despliegue del sistema en un entorno real.
 A diferencia de la evaluación matemática sobre audios de 5 segundos, este script
-carga un audio largo (de varios minutos) simulando una "cámara de vigilancia continua",
+carga un audio largo simulando una "cámara de vigilancia continua",
 aplica la técnica de ventana deslizante, y registra las latencias de detección y falsos positivos.
 """
 
@@ -20,6 +20,8 @@ from entrenar_transfer import TransferHead
 from panns_inference import AudioTagging
 
 # Configuramos la ventana deslizante: 5 segundos de tamaño, avanza cada 2.5 segundos
+# porque el modelo fue entrenado con ventanas de 5 segundos, entonces necesitamos
+# que las ventanas se solapen para no perder información.
 SAMPLE_RATE, VENTANA, AVANCE = 32000, int(5.0 * 32000), int(2.5 * 32000)
 
 def main():
