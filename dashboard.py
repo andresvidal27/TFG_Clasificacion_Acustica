@@ -5,6 +5,8 @@ Dashboard simplificado de análisis interactivo con Streamlit.
 Esta es la interfaz gráfica (UI) base ORIGINAL (sin el sistema de reentrenamiento por feedback).
 Permite grabar audio, subir archivos locales, y ver cómo los modelos (CNN y Transfer Learning)
 analizan las ondas segundo a segundo.
+
+Soporta tanto modelos individuales como ensembles de 5 fases (promediado de predicciones).
 """
 
 import sys
@@ -30,35 +32,56 @@ sys.path.insert(0, str(BASE_DIR / "src"))
 
 from src.datos_y_configuracion import SR as CONFIG_SR, compute_logmel, add_awgn, CLASS_MAP
 from src.entrenar_transfer import TransferHead
-from src.entrenar_cnn import AudioCNN
+from src.entrenar_cnn import AudioCNN, ENSEMBLE_SEEDS
 from panns_inference import AudioTagging
 
 # Configuración base de la web de Streamlit
 st.set_page_config(page_title="Dashboard Acústico", layout="wide")
+
+def _cargar_ensemble(ModelClass, num_classes, pattern, device):
+    """
+    Intenta cargar los 5 modelos ensemble. Si no existen, devuelve lista vacía.
+    """
+    modelos = []
+    for i in range(len(ENSEMBLE_SEEDS)):
+        ruta = BASE_DIR / "models" / f"{pattern}_{i}_best.pt"
+        if ruta.exists():
+            m = ModelClass(num_classes=num_classes).to(device).eval()
+            m.load_state_dict(torch.load(ruta, map_location=device, weights_only=True))
+            modelos.append(m)
+    return modelos
 
 @st.cache_resource
 def load_models():
     """
     Función cacheada para cargar los modelos en memoria de la GPU (o CPU) una sola vez
     al iniciar el dashboard. Evita latencias de lectura de disco.
+    Carga tanto modelos individuales como ensembles si están disponibles.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    nc = len(CLASS_MAP)
     
     # 1. Extractor base PANNs
     panns = AudioTagging(checkpoint_path=str(BASE_DIR / "models/Cnn14_mAP=0.431.pth"), device=str(device))
     
-    # 2. Cabeza de Transfer Learning
-    model_transfer = TransferHead(num_classes=len(CLASS_MAP)).to(device).eval()
+    # 2. Cabeza de Transfer Learning (individual)
+    model_transfer = TransferHead(num_classes=nc).to(device).eval()
     model_transfer.load_state_dict(torch.load(BASE_DIR / "models/transfer_head_best.pt", map_location=device, weights_only=True))
     
-    # 3. Modelo CNN (por si queremos comparar)
-    model_cnn = AudioCNN(num_classes=len(CLASS_MAP)).to(device).eval()
+    # 3. Modelo CNN individual (por si queremos comparar)
+    model_cnn = AudioCNN(num_classes=nc).to(device).eval()
     try:
         model_cnn.load_state_dict(torch.load(BASE_DIR / "models/cnn_base_best.pt", map_location=device, weights_only=True))
     except Exception:
         model_cnn = None
 
-    # 4. Umbral (Theta) para las alertas
+    # 4. Ensemble CNN (5 modelos)
+    ensemble_cnn = _cargar_ensemble(AudioCNN, nc, "cnn_ensemble_fold", device)
+    
+    # 5. Ensemble Transfer Learning (5 modelos)
+    ensemble_transfer = _cargar_ensemble(TransferHead, nc, "transfer_ensemble_fold", device)
+
+    # 6. Umbral (Theta) para las alertas
     theta = 0.85
     thresholds_por_clase = {}
     min_rms_general = 0.025
@@ -74,14 +97,37 @@ def load_models():
         except Exception:
             pass
             
-    return panns, model_transfer, model_cnn, device, theta, thresholds_por_clase, min_rms_general, min_rms_por_clase
+    return panns, model_transfer, model_cnn, ensemble_cnn, ensemble_transfer, device, theta, thresholds_por_clase, min_rms_general, min_rms_por_clase
+
+def _inferir_ensemble_cnn(ensemble_modelos, logmel_tensor, device):
+    """Promedia las predicciones softmax de los N modelos CNN del ensemble."""
+    probs_acum = None
+    with torch.no_grad():
+        for modelo in ensemble_modelos:
+            probs = F.softmax(modelo(logmel_tensor), dim=1).cpu().numpy()[0]
+            probs_acum = probs if probs_acum is None else probs_acum + probs
+    return probs_acum / len(ensemble_modelos)
+
+def _inferir_ensemble_transfer(ensemble_modelos, emb_tensor, device):
+    """Promedia las predicciones softmax de los N modelos Transfer del ensemble."""
+    probs_acum = None
+    with torch.no_grad():
+        for modelo in ensemble_modelos:
+            probs = F.softmax(modelo(emb_tensor), dim=1).cpu().numpy()[0]
+            probs_acum = probs if probs_acum is None else probs_acum + probs
+    return probs_acum / len(ensemble_modelos)
 
 def analyze_audio_buffer(y, sr, snr=None):
     """
     Toma una señal cruda de audio de cualquier tamaño, la divide en ventanas de 5s 
     solapadas, y extrae las predicciones temporales completas.
+    Usa el ensemble si está disponible, sino usa los modelos individuales.
     """
-    panns, model_transfer, model_cnn, device, theta, thresholds_por_clase, min_rms_general, min_rms_por_clase = load_models()
+    panns, model_transfer, model_cnn, ensemble_cnn, ensemble_transfer, device, theta, thresholds_por_clase, min_rms_general, min_rms_por_clase = load_models()
+    
+    # Determinar si usamos ensemble o modelo individual
+    usar_ensemble_tf = len(ensemble_transfer) == 5
+    usar_ensemble_cnn = len(ensemble_cnn) == 5
     
     # Si el usuario selecciona añadir ruido artificial desde la interfaz
     if snr and snr != "Limpio": y = add_awgn(y, int(snr))
@@ -103,7 +149,14 @@ def analyze_audio_buffer(y, sr, snr=None):
         with torch.no_grad():
             bloque_32k = librosa.resample(bloque, orig_sr=sr, target_sr=32000)
             _, emb = panns.inference(bloque_32k[None, :])
-            probs_tf = F.softmax(model_transfer(torch.from_numpy(emb[0]).float().unsqueeze(0).to(device)), dim=1).cpu().numpy()[0]
+            emb_tensor = torch.from_numpy(emb[0]).float().unsqueeze(0).to(device)
+            
+            # Usar ensemble o modelo individual según disponibilidad
+            if usar_ensemble_tf:
+                probs_tf = _inferir_ensemble_transfer(ensemble_transfer, emb_tensor, device)
+            else:
+                probs_tf = F.softmax(model_transfer(emb_tensor), dim=1).cpu().numpy()[0]
+            
             clase_pred = CLASS_MAP[np.argmax(probs_tf)]
             res_tf.append({"segundo": segundo, "probs": probs_tf})
             
@@ -128,14 +181,18 @@ def analyze_audio_buffer(y, sr, snr=None):
                         alertas.append((segundo, clase_pred, max_prob))
                 
         # --- CNN Base Inferencia ---
-        if model_cnn:
+        if model_cnn or usar_ensemble_cnn:
             sig_22k = librosa.resample(bloque, orig_sr=sr, target_sr=22050)
             max_val = np.max(np.abs(sig_22k))
             if max_val > 0: sig_22k /= max_val
             # Extraer espectrograma en vivo
             logmel = torch.from_numpy(compute_logmel(sig_22k)).float().unsqueeze(0).unsqueeze(0).to(device)
             with torch.no_grad():
-                res_cnn.append({"segundo": segundo, "probs": F.softmax(model_cnn(logmel), dim=1).cpu().numpy()[0]})
+                if usar_ensemble_cnn:
+                    probs_cnn = _inferir_ensemble_cnn(ensemble_cnn, logmel, device)
+                elif model_cnn:
+                    probs_cnn = F.softmax(model_cnn(logmel), dim=1).cpu().numpy()[0]
+                res_cnn.append({"segundo": segundo, "probs": probs_cnn})
                 
     return res_tf, res_cnn, alertas, y
 
@@ -153,6 +210,12 @@ def plot_probs(res, title):
 # UI MAIN (PÁGINA STREAMLIT)
 # ==============================================================================
 st.title("🎙️ Analizador de Audio en Vivo")
+
+# Indicar qué modo de inferencia se está usando
+_, _, _, ensemble_cnn, ensemble_transfer, _, _, _, _, _ = load_models()
+modo_cnn = "Ensemble (5 modelos)" if len(ensemble_cnn) == 5 else "Individual"
+modo_tf = "Ensemble (5 modelos)" if len(ensemble_transfer) == 5 else "Individual"
+st.caption(f"CNN: {modo_cnn} | Transfer Learning: {modo_tf}")
 
 # Pestañas de navegación
 tabs = st.tabs(["Prueba", "Comparativa", "Espectrogramas", "CNN", "Transfer", "Robustez"])

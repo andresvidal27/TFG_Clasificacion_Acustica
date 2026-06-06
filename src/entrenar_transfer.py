@@ -6,6 +6,9 @@ para entrenarla usando los embeddings extraídos por el modelo PANNs CNN14.
 Esto es Transfer Learning: aprovechamos un modelo ya preentrenado con millones de 
 audios (PANNs) que nos da un vector matemático (embedding) de 2048 dimensiones.
 Nosotros solo entrenamos esta pequeña red (cabeza) para que traduzca ese vector a nuestras 8 clases.
+
+Incluye también la función de entrenamiento Ensemble (5 fases) que entrena 5 cabezas
+con semillas diferentes y permite promediar sus predicciones para mayor robustez.
 """
 
 import sys
@@ -21,7 +24,7 @@ from torch.utils.data import Dataset, DataLoader
 # Importar configuración global y utilidades del otro script
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from datos_y_configuracion import BASE_DIR
-from entrenar_cnn import calcular_pesos_clases
+from entrenar_cnn import calcular_pesos_clases, ENSEMBLE_SEEDS
 
 # ==============================================================================
 # 1. DEFINICIÓN DEL MODELO TRANSFER LEARNING (LA "CABEZA")
@@ -74,9 +77,20 @@ class DatasetEmbeddings(Dataset):
 # ==============================================================================
 # 3. BUCLE DE ENTRENAMIENTO PRINCIPAL
 # ==============================================================================
-def entrenar_transfer():
-    """Bucle principal de entrenamiento para la cabeza de Transfer Learning."""
-    print("Iniciando entrenamiento del modelo Transfer Learning (con Data Augmentation)...")
+def _entrenar_transfer_una_vez(seed=42, nombre_modelo="transfer_head"):
+    """
+    Bucle principal de entrenamiento para una sola ejecución de la cabeza Transfer Learning.
+    Parámetros:
+        seed: Semilla para reproducibilidad (distintas semillas = distintos modelos ensemble).
+        nombre_modelo: Prefijo para guardar el archivo .pt y el historial JSON.
+    """
+    # Fijar semilla para reproducibilidad de esta fase particular
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    
+    print(f"\nIniciando entrenamiento de '{nombre_modelo}' (seed={seed})...")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -90,7 +104,8 @@ def entrenar_transfer():
     num_classes = df["label_id"].nunique()
 
     # DataLoaders: Generan lotes de 32 muestras
-    train_loader = DataLoader(DatasetEmbeddings(train_df), batch_size=32, shuffle=True)
+    g = torch.Generator().manual_seed(seed)
+    train_loader = DataLoader(DatasetEmbeddings(train_df), batch_size=32, shuffle=True, generator=g)
     val_loader = DataLoader(DatasetEmbeddings(val_df), batch_size=32, shuffle=False)
 
     # 1. Instanciamos la cabeza en la GPU (o CPU)
@@ -108,8 +123,6 @@ def entrenar_transfer():
     historial = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
     mejor_loss = float("inf")
     paciencia, epochs_sin_mejora = 12, 0 # Permitimos 12 épocas sin mejora antes de abortar
-    
-    nombre_modelo = "transfer_head"
     ruta_guardado = BASE_DIR / "models" / f"{nombre_modelo}_best.pt"
     ruta_guardado.parent.mkdir(exist_ok=True)
 
@@ -148,7 +161,7 @@ def entrenar_transfer():
         historial["val_loss"].append(v_loss / v_total)
         historial["val_acc"].append(v_correct / v_total)
 
-        print(f"Epoch {epoch:03d} | Train Loss: {historial['train_loss'][-1]:.4f} Acc: {historial['train_acc'][-1]:.4f} | Val Loss: {historial['val_loss'][-1]:.4f} Acc: {historial['val_acc'][-1]:.4f}")
+        print(f"  Epoch {epoch:03d} | Train Loss: {historial['train_loss'][-1]:.4f} Acc: {historial['train_acc'][-1]:.4f} | Val Loss: {historial['val_loss'][-1]:.4f} Acc: {historial['val_acc'][-1]:.4f}")
 
         # --- Lógica de Early Stopping ---
         # Guardar el modelo en disco SOLAMENTE si bate el récord de pérdida mínima en Validación
@@ -159,13 +172,59 @@ def entrenar_transfer():
         else:
             epochs_sin_mejora += 1
             if epochs_sin_mejora >= paciencia:
-                print(f"Early stopping en epoch {epoch}.")
+                print(f"  Early stopping en epoch {epoch}.")
                 break
 
     # Guardar historial en un JSON para poder graficarlo después
     with open(BASE_DIR / "models" / f"history_{nombre_modelo}.json", "w") as f:
         json.dump(historial, f)
-    print(f"[OK] Modelo guardado en {ruta_guardado}\n")
+    print(f"  [OK] Modelo guardado en {ruta_guardado}")
+    
+    return historial
+
+def entrenar_transfer():
+    """Entrena un solo modelo Transfer Learning (comportamiento original)."""
+    print("Iniciando entrenamiento del modelo Transfer Learning (con Data Augmentation)...")
+    _entrenar_transfer_una_vez(seed=42, nombre_modelo="transfer_head")
+    print("[OK] Entrenamiento Transfer Learning individual completado.\n")
+
+def entrenar_transfer_ensemble():
+    """
+    Entrena 5 cabezas Transfer Learning con semillas diferentes (Ensemble de 5 fases).
+    Cada modelo se guarda como 'transfer_ensemble_fold_0_best.pt' ... 'transfer_ensemble_fold_4_best.pt'.
+    Al promediar las predicciones softmax de los 5 modelos se obtiene un resultado más robusto
+    y estable, reduciendo la varianza de las predicciones individuales.
+    """
+    print("=" * 60)
+    print("ENTRENAMIENTO ENSEMBLE TRANSFER LEARNING (5 FASES)")
+    print("=" * 60)
+    
+    historiales = []
+    for i, seed in enumerate(ENSEMBLE_SEEDS):
+        print(f"\n{'─' * 40}")
+        print(f"FASE {i+1}/5 (Seed: {seed})")
+        print(f"{'─' * 40}")
+        h = _entrenar_transfer_una_vez(seed=seed, nombre_modelo=f"transfer_ensemble_fold_{i}")
+        historiales.append(h)
+    
+    # Guardar resumen del ensemble
+    resumen = {
+        "seeds": ENSEMBLE_SEEDS,
+        "num_folds": 5,
+        "best_val_acc_per_fold": [max(h["val_acc"]) for h in historiales],
+        "mean_best_val_acc": float(np.mean([max(h["val_acc"]) for h in historiales])),
+    }
+    with open(BASE_DIR / "models" / "ensemble_transfer_summary.json", "w") as f:
+        json.dump(resumen, f, indent=2)
+    
+    print(f"\n{'=' * 60}")
+    print(f"ENSEMBLE TRANSFER LEARNING COMPLETADO")
+    print(f"  Mejor Val Acc por fold: {[f'{a:.4f}' for a in resumen['best_val_acc_per_fold']]}")
+    print(f"  Media Best Val Acc:     {resumen['mean_best_val_acc']:.4f}")
+    print(f"{'=' * 60}\n")
 
 if __name__ == "__main__":
+    # Primero entrenamos el modelo individual (compatible con el comportamiento original)
     entrenar_transfer()
+    # Luego entrenamos el ensemble de 5 fases
+    entrenar_transfer_ensemble()
